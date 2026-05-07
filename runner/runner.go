@@ -30,14 +30,14 @@ import (
 	"github.com/PuerkitoBio/goquery"
 	"github.com/corona10/goimagehash"
 	"github.com/gocarina/gocsv"
+	"github.com/happyhackingspace/dit"
 	"github.com/mfonda/simhash"
 	asnmap "github.com/projectdiscovery/asnmap/libs"
 	"github.com/projectdiscovery/fastdialer/fastdialer"
+	"github.com/projectdiscovery/httpx/common/authprovider"
 	"github.com/projectdiscovery/httpx/common/customextract"
 	"github.com/projectdiscovery/httpx/common/hashes/jarm"
 	"github.com/projectdiscovery/httpx/common/inputformats"
-	"github.com/happyhackingspace/dit"
-	"github.com/projectdiscovery/httpx/common/authprovider"
 	"github.com/projectdiscovery/httpx/static"
 	"github.com/projectdiscovery/mapcidr/asn"
 	"github.com/projectdiscovery/networkpolicy"
@@ -80,25 +80,25 @@ import (
 
 // Runner is a client for running the enumeration process.
 type Runner struct {
-	seenMux sync.Mutex
-	options            *Options
-	hp                 *httpx.HTTPX
-	wappalyzer         *wappalyzer.Wappalyze
-	cpeDetector        *CPEDetector
-	wpDetector         *WordPressDetector
-	scanopts           ScanOptions
-	hm                 *hybrid.HybridMap
-	excludeCdn         bool
-	stats              clistats.StatisticsClient
-	ratelimiter        ratelimit.Limiter
-	HostErrorsCache    gcache.Cache[string, int]
-	browser            *Browser
-	ditClassifier *dit.Classifier
-	pHashClusters      []pHashCluster
-	simHashes          gcache.Cache[uint64, []string]
-	httpApiEndpoint    *Server
-	authProvider       authprovider.AuthProvider
-	interruptCh        chan struct{}
+	seenMux         sync.Mutex
+	options         *Options
+	hp              *httpx.HTTPX
+	wappalyzer      *wappalyzer.Wappalyze
+	cpeDetector     *CPEDetector
+	wpDetector      *WordPressDetector
+	scanopts        ScanOptions
+	hm              *hybrid.HybridMap
+	excludeCdn      bool
+	stats           clistats.StatisticsClient
+	ratelimiter     ratelimit.Limiter
+	HostErrorsCache gcache.Cache[string, int]
+	browser         *Browser
+	ditClassifier   *dit.Classifier
+	pHashClusters   []pHashCluster
+	simHashes       gcache.Cache[uint64, []string]
+	httpApiEndpoint *Server
+	authProvider    authprovider.AuthProvider
+	interruptCh     chan struct{}
 }
 
 func (r *Runner) HTTPX() *httpx.HTTPX {
@@ -148,7 +148,7 @@ func New(options *Options) (*Runner, error) {
 	var err error
 	if options.Wappalyzer != nil {
 		runner.wappalyzer = options.Wappalyzer
-	} else if options.TechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload {
+	} else if options.TechDetect || options.HeadlessTechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload {
 		runner.wappalyzer, err = func() (*wappalyzer.Wappalyze, error) {
 			if options.CustomFingerprintFile != "" {
 				return wappalyzer.NewFromFile(options.CustomFingerprintFile, true, true)
@@ -341,6 +341,7 @@ func New(options *Options) (*Runner, error) {
 	scanopts.NoFallback = options.NoFallback
 	scanopts.NoFallbackScheme = options.NoFallbackScheme
 	scanopts.TechDetect = options.TechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload
+	scanopts.HeadlessTechDetect = options.HeadlessTechDetect
 	scanopts.CPEDetect = options.CPEDetect || options.JSONOutput || options.CSVOutput
 	scanopts.WordPress = options.WordPress || options.JSONOutput || options.CSVOutput
 	scanopts.StoreChain = options.StoreChain
@@ -348,7 +349,7 @@ func New(options *Options) (*Runner, error) {
 	scanopts.MaxResponseBodySizeToSave = options.MaxResponseBodySizeToSave
 	scanopts.MaxResponseBodySizeToRead = options.MaxResponseBodySizeToRead
 	scanopts.extractRegexps = make(map[string]*regexp.Regexp)
-	if options.Screenshot {
+	if options.Screenshot || options.HeadlessTechDetect {
 		browser, err := NewBrowser(options.HTTPProxy, options.UseInstalledChrome, options.ParseHeadlessOptionalArguments())
 		if err != nil {
 			return nil, err
@@ -925,7 +926,7 @@ func (r *Runner) Close() {
 	if r.options.HostMaxErrors >= 0 {
 		r.HostErrorsCache.Purge()
 	}
-	if r.options.Screenshot {
+	if r.options.Screenshot || r.options.HeadlessTechDetect {
 		r.browser.Close()
 	}
 	if r.options.ShowStatistics {
@@ -2541,35 +2542,50 @@ retry:
 	var (
 		screenshotBytes []byte
 		headlessBody    string
+		runtimeMatches  map[string]wappalyzer.AppInfo
 	)
 	var pHash uint64
-	if scanopts.Screenshot {
+	if scanopts.Screenshot || scanopts.HeadlessTechDetect {
 		var err error
-		screenshotBytes, headlessBody, linkRequest, err = r.browser.ScreenshotWithBody(
-			fullURL,
-			scanopts.ScreenshotTimeout,
-			scanopts.ScreenshotIdle,
-			r.options.CustomHeaders,
-			scanopts.IsScreenshotFullPage(),
-			r.options.JavascriptCodes,
-		)
+		headlessResult, err := r.browser.VisitWithArtifacts(fullURL, HeadlessVisitOptions{
+			Timeout:                 scanopts.ScreenshotTimeout,
+			Idle:                    scanopts.ScreenshotIdle,
+			Headers:                 r.options.CustomHeaders,
+			FullPage:                scanopts.IsScreenshotFullPage(),
+			JSCodes:                 r.options.JavascriptCodes,
+			CaptureScreenshot:       scanopts.Screenshot,
+			DetectRuntimeTechnology: scanopts.HeadlessTechDetect,
+			WappalyzerClient:        r.wappalyzer,
+		})
 		if err != nil {
-			gologger.Warning().Msgf("Could not take screenshot '%s': %s", fullURL, err)
+			gologger.Warning().Msgf("Could not run headless probes '%s': %s", fullURL, err)
 		} else {
-			pHash, err = calculatePerceptionHash(screenshotBytes)
-			if err != nil {
-				gologger.Warning().Msgf("%v: %s", err, fullURL)
+			screenshotBytes = headlessResult.ScreenshotBytes
+			headlessBody = headlessResult.Body
+			linkRequest = headlessResult.NetworkRequests
+			runtimeMatches = headlessResult.RuntimeMatches
+
+			if scanopts.Screenshot {
+				pHash, err = calculatePerceptionHash(screenshotBytes)
+				if err != nil {
+					gologger.Warning().Msgf("%v: %s", err, fullURL)
+				}
 			}
 
-			// As we now have headless body, we can also use it for detecting
-			// more technologies in the response. This is a quick trick to get
-			// more detected technologies.
-			if r.options.TechDetect || r.options.JSONOutput || r.options.CSVOutput {
+			if scanopts.TechDetect {
 				moreMatches := r.wappalyzer.FingerprintWithInfo(resp.Headers, []byte(headlessBody))
 				for match, data := range moreMatches {
 					technologies = append(technologies, match)
 					technologyDetails[match] = data
 				}
+			}
+			if scanopts.HeadlessTechDetect {
+				for match, data := range runtimeMatches {
+					technologies = append(technologies, match)
+					technologyDetails[match] = data
+				}
+			}
+			if scanopts.TechDetect {
 				technologies = sliceutil.Dedupe(technologies)
 			}
 		}
@@ -2636,60 +2652,60 @@ retry:
 	}
 
 	result := Result{
-		Timestamp:        time.Now(),
-		Request:          request,
-		LinkRequest:      linkRequest,
-		ResponseHeaders:  responseHeaders,
-		RawHeaders:       rawResponseHeaders,
-		Scheme:           parsed.Scheme,
-		Port:             finalPort,
-		Path:             finalPath,
-		Raw:              resp.Raw,
-		URL:              fullURL,
-		Input:            origInput,
-		ContentLength:    resp.ContentLength,
-		ChainStatusCodes: chainStatusCodes,
-		Chain:            chainItems,
-		StatusCode:       resp.StatusCode,
-		Location:         resp.GetHeaderPart("Location", ";"),
-		ContentType:      resp.GetHeaderPart("Content-Type", ";"),
-		Title:            title,
-		str:              builder.String(),
-		VHost:            isvhost,
-		WebServer:        serverHeader,
-		ResponseBody:     serverResponseRaw,
-		BodyPreview:      bodyPreview,
-		WebSocket:        isWebSocket,
-		TLSData:          resp.TLSData,
-		CSPData:          resp.CSPData,
-		Pipeline:         pipeline,
-		HTTP2:            http2,
-		Method:           method,
-		Host:             parsed.Hostname(),
-		HostIP:           ip,
-		A:                ips4,
-		AAAA:             ips6,
-		CNAMEs:           cnames,
-		CDN:              isCDN,
-		CDNName:          cdnName,
-		CDNType:          cdnType,
-		ResponseTime:     resp.Duration.String(),
-		Technologies:     technologies,
-		FinalURL:         finalURL,
-		FavIconMMH3:      faviconMMH3,
-		FavIconMD5:       faviconMD5,
-		FaviconPath:      faviconPath,
-		FaviconURL:       faviconURL,
-		Hashes:           hashesMap,
-		Extracts:         extractResult,
-		JarmHash:         jarmhash,
-		Lines:            resp.Lines,
-		Words:            resp.Words,
-		ASN:              asnResponse,
-		ExtractRegex:     extractRegex,
-		ScreenshotBytes:  screenshotBytes,
-		HeadlessBody:     headlessBody,
-		KnowledgeBase: r.classifyPage(headlessBody, respData, pHash),
+		Timestamp:         time.Now(),
+		Request:           request,
+		LinkRequest:       linkRequest,
+		ResponseHeaders:   responseHeaders,
+		RawHeaders:        rawResponseHeaders,
+		Scheme:            parsed.Scheme,
+		Port:              finalPort,
+		Path:              finalPath,
+		Raw:               resp.Raw,
+		URL:               fullURL,
+		Input:             origInput,
+		ContentLength:     resp.ContentLength,
+		ChainStatusCodes:  chainStatusCodes,
+		Chain:             chainItems,
+		StatusCode:        resp.StatusCode,
+		Location:          resp.GetHeaderPart("Location", ";"),
+		ContentType:       resp.GetHeaderPart("Content-Type", ";"),
+		Title:             title,
+		str:               builder.String(),
+		VHost:             isvhost,
+		WebServer:         serverHeader,
+		ResponseBody:      serverResponseRaw,
+		BodyPreview:       bodyPreview,
+		WebSocket:         isWebSocket,
+		TLSData:           resp.TLSData,
+		CSPData:           resp.CSPData,
+		Pipeline:          pipeline,
+		HTTP2:             http2,
+		Method:            method,
+		Host:              parsed.Hostname(),
+		HostIP:            ip,
+		A:                 ips4,
+		AAAA:              ips6,
+		CNAMEs:            cnames,
+		CDN:               isCDN,
+		CDNName:           cdnName,
+		CDNType:           cdnType,
+		ResponseTime:      resp.Duration.String(),
+		Technologies:      technologies,
+		FinalURL:          finalURL,
+		FavIconMMH3:       faviconMMH3,
+		FavIconMD5:        faviconMD5,
+		FaviconPath:       faviconPath,
+		FaviconURL:        faviconURL,
+		Hashes:            hashesMap,
+		Extracts:          extractResult,
+		JarmHash:          jarmhash,
+		Lines:             resp.Lines,
+		Words:             resp.Words,
+		ASN:               asnResponse,
+		ExtractRegex:      extractRegex,
+		ScreenshotBytes:   screenshotBytes,
+		HeadlessBody:      headlessBody,
+		KnowledgeBase:     r.classifyPage(headlessBody, respData, pHash),
 		TechnologyDetails: technologyDetails,
 		Resolvers:         resolvers,
 		RequestRaw:        requestDump,
