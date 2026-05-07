@@ -86,6 +86,7 @@ type ScanOptions struct {
 	NoFallback                bool
 	NoFallbackScheme          bool
 	TechDetect                bool
+	HeadlessTechDetect        bool
 	CPEDetect                 bool
 	WordPress                 bool
 	StoreChain                bool
@@ -151,6 +152,7 @@ func (s *ScanOptions) Clone() *ScanOptions {
 		NoFallback:                s.NoFallback,
 		NoFallbackScheme:          s.NoFallbackScheme,
 		TechDetect:                s.TechDetect,
+		HeadlessTechDetect:        s.HeadlessTechDetect,
 		CPEDetect:                 s.CPEDetect,
 		WordPress:                 s.WordPress,
 		StoreChain:                s.StoreChain,
@@ -189,20 +191,20 @@ type Options struct {
 	// Deprecated: use Proxy
 	HTTPProxy string
 	// Deprecated: use Proxy
-	SocksProxy                string
-	Proxy                     string
-	InputFile                 string
-	InputMode                 string
-	InputTargetHost           goflags.StringSlice
-	Methods                   string
-	RequestURI                string
-	RequestURIs               string
-	requestURIs               []string
-	OutputMatchStatusCode     string
-	OutputMatchContentLength  string
-	OutputFilterStatusCode    string
+	SocksProxy               string
+	Proxy                    string
+	InputFile                string
+	InputMode                string
+	InputTargetHost          goflags.StringSlice
+	Methods                  string
+	RequestURI               string
+	RequestURIs              string
+	requestURIs              []string
+	OutputMatchStatusCode    string
+	OutputMatchContentLength string
+	OutputFilterStatusCode   string
 	// Deprecated: use OutputFilterPageType with "error" instead.
-	OutputFilterErrorPage bool
+	OutputFilterErrorPage     bool
 	OutputFilterPageType      goflags.StringSlice
 	FilterOutDuplicates       bool
 	OutputFilterContentLength string
@@ -265,6 +267,7 @@ type Options struct {
 	NoFallback                bool
 	NoFallbackScheme          bool
 	TechDetect                bool
+	HeadlessTechDetect        bool
 	CPEDetect                 bool
 	WordPress                 bool
 	CustomFingerprintFile     string
@@ -409,6 +412,7 @@ func ParseOptions() *Options {
 		flagSet.DynamicVarP(&options.ResponseBodyPreviewSize, "body-preview", "bp", 100, "display first N characters of response body"),
 		flagSet.BoolVarP(&options.OutputServerHeader, "web-server", "server", false, "display server name"),
 		flagSet.BoolVarP(&options.TechDetect, "tech-detect", "td", false, "display technology in use based on wappalyzer dataset"),
+		flagSet.BoolVarP(&options.HeadlessTechDetect, "tech-detect-headless", "tdh", false, "enhance technology detection using headless browser JavaScript, DOM, cookies, and loaded resources"),
 		flagSet.StringVarP(&options.CustomFingerprintFile, "custom-fingerprint-file", "cff", "", "path to a custom fingerprint file for technology detection"),
 		flagSet.BoolVar(&options.CPEDetect, "cpe", false, "display CPE (Common Platform Enumeration) based on awesome-search-queries"),
 		flagSet.BoolVarP(&options.WordPress, "wordpress", "wp", false, "display WordPress plugins and themes"),
@@ -620,6 +624,10 @@ func ParseOptions() *Options {
 		if err := flagSet.MergeConfigFile(cfgFile); err != nil {
 			gologger.Fatal().Msgf("Could not read config: %s\n", err)
 		}
+	}
+
+	if options.HeadlessTechDetect {
+		options.TechDetect = true
 	}
 
 	if options.PdcpAuthCredFile != "" {
