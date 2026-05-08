@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -44,6 +45,13 @@ type runtimeDOMSpec struct {
 	Properties []string `json:"properties,omitempty"`
 	NeedsText  bool     `json:"needsText,omitempty"`
 }
+
+var (
+	viteModuleScriptPattern    = regexp.MustCompile(`<script\b[^>]*\btype=["']module["'][^>]*\bsrc=["'][^"']*/assets/[^"']+\.js["']`)
+	viteStylesheetPattern      = regexp.MustCompile(`<link\b[^>]*\brel=["']stylesheet["'][^>]*\bhref=["'][^"']*/assets/[^"']+\.css["']`)
+	viteAssetScriptPathPattern = regexp.MustCompile(`/assets/[^/?#]+\.js(?:[?#].*)?$`)
+	viteAssetStylePathPattern  = regexp.MustCompile(`/assets/[^/?#]+\.css(?:[?#].*)?$`)
+)
 
 type HeadlessVisitOptions struct {
 	Timeout                 time.Duration
@@ -166,7 +174,7 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 		RuntimeMatches:  map[string]wappalyzer.AppInfo{},
 	}
 	if options.DetectRuntimeTechnology {
-		result.RuntimeMatches = b.detectRuntimeTechnologies(page, networkRequests, options.WappalyzerClient)
+		result.RuntimeMatches = b.detectRuntimeTechnologies(page, networkRequests, body, options.WappalyzerClient)
 	}
 
 	return result, nil
@@ -369,7 +377,7 @@ func (b *Browser) ExecuteJavascriptCodesWithPage(page *rod.Page, jsc []string) (
 	return outputs, nil
 }
 
-func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []NetworkRequest, wappalyzerClient *wappalyzer.Wappalyze) map[string]wappalyzer.AppInfo {
+func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []NetworkRequest, pageBody string, wappalyzerClient *wappalyzer.Wappalyze) map[string]wappalyzer.AppInfo {
 	technologies := map[string]wappalyzer.AppInfo{}
 	if wappalyzerClient == nil {
 		return technologies
@@ -443,6 +451,8 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, app, version)
 	}
 
+	addRuntimeBundleTechnologies(technologies, wappalyzerClient, originalFingerprints, pageBody, networkRequests, scriptBodies)
+
 	return technologies
 }
 
@@ -462,6 +472,15 @@ func addRuntimeTechnology(technologies map[string]wappalyzer.AppInfo, wappalyzer
 				technologies[implied] = wappalyzer.AppInfoFromFingerprint(impliedFingerprint)
 			}
 		}
+	}
+}
+
+func addRuntimeBundleTechnologies(technologies map[string]wappalyzer.AppInfo, wappalyzerClient *wappalyzer.Wappalyze, originalFingerprints *wappalyzer.Fingerprints, pageBody string, networkRequests []NetworkRequest, scriptBodies []string) {
+	if hasReactBundleEvidence(scriptBodies) {
+		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "React", "")
+	}
+	if hasViteBundleEvidence(pageBody, networkRequests, scriptBodies) {
+		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "Vite", "")
 	}
 }
 
@@ -803,6 +822,77 @@ func isLikelyCSSRequest(request NetworkRequest) bool {
 
 	return resourceType == "stylesheet" ||
 		strings.Contains(url, ".css")
+}
+
+func hasReactBundleEvidence(scriptBodies []string) bool {
+	for _, body := range scriptBodies {
+		if !strings.Contains(body, "@license react") {
+			continue
+		}
+		if strings.Contains(body, "react.production.min.js") ||
+			strings.Contains(body, "react-dom.production.min.js") ||
+			strings.Contains(body, "react-jsx-runtime.production.min.js") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasViteBundleEvidence(pageBody string, networkRequests []NetworkRequest, scriptBodies []string) bool {
+	body := strings.ToLower(pageBody)
+	if strings.Contains(body, "data-vite") {
+		return true
+	}
+
+	hasModuleAsset := hasViteModuleAsset(body, networkRequests)
+	if !hasModuleAsset {
+		return false
+	}
+
+	return hasViteStylesheetAsset(body, networkRequests) && hasViteModulePreloadEvidence(body, scriptBodies)
+}
+
+func hasViteModuleAsset(body string, networkRequests []NetworkRequest) bool {
+	if viteModuleScriptPattern.MatchString(body) {
+		return true
+	}
+
+	for _, request := range networkRequests {
+		if strings.EqualFold(request.ResourceType, "script") && viteAssetScriptPathPattern.MatchString(strings.ToLower(request.URL)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasViteStylesheetAsset(body string, networkRequests []NetworkRequest) bool {
+	if viteStylesheetPattern.MatchString(body) {
+		return true
+	}
+
+	for _, request := range networkRequests {
+		if strings.EqualFold(request.ResourceType, "stylesheet") && viteAssetStylePathPattern.MatchString(strings.ToLower(request.URL)) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasViteModulePreloadEvidence(body string, scriptBodies []string) bool {
+	if strings.Contains(body, "modulepreload") {
+		return true
+	}
+
+	for _, scriptBody := range scriptBodies {
+		if strings.Contains(scriptBody, "modulepreload") {
+			return true
+		}
+	}
+
+	return false
 }
 
 func (b *Browser) matchDOMFingerprint(fingerprint *wappalyzer.Fingerprint, domValues map[string]runtimeDOMValue) (bool, string) {
