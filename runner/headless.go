@@ -25,12 +25,13 @@ import (
 )
 
 type NetworkRequest struct {
-	RequestID    string
-	URL          string
-	Method       string
-	ResourceType string
-	StatusCode   int
-	ErrorType    string
+	RequestID       string
+	URL             string
+	Method          string
+	ResourceType    string
+	StatusCode      int
+	ErrorType       string
+	ResponseHeaders map[string]string `json:"-"`
 }
 
 type headlessNetworkTracker struct {
@@ -63,7 +64,7 @@ func (t *headlessNetworkTracker) start(request NetworkRequest) {
 	t.lastEvent = time.Now()
 }
 
-func (t *headlessNetworkTracker) response(requestID string, status int, resourceType string) {
+func (t *headlessNetworkTracker) response(requestID string, status int, resourceType string, headers proto.NetworkHeaders) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
@@ -75,6 +76,7 @@ func (t *headlessNetworkTracker) response(requestID string, status int, resource
 	if request.ResourceType == "" {
 		request.ResourceType = resourceType
 	}
+	request.ResponseHeaders = normalizeNetworkHeaders(headers)
 	t.lastEvent = time.Now()
 }
 
@@ -311,7 +313,7 @@ func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, header
 	})()
 	// Intercept inbound responses
 	go page.EachEvent(func(e *proto.NetworkResponseReceived) {
-		networkTracker.response(string(e.RequestID), e.Response.Status, string(e.Type))
+		networkTracker.response(string(e.RequestID), e.Response.Status, string(e.Type), e.Response.Headers)
 	})()
 	// Intercept network end requests
 	go page.EachEvent(func(e *proto.NetworkLoadingFinished) {
@@ -519,6 +521,8 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 		return technologies
 	}
 
+	addHeadlessBodyTechnologies(technologies, wappalyzerClient, pageBody)
+
 	originalFingerprints := wappalyzerClient.GetFingerprints()
 	if originalFingerprints == nil {
 		return technologies
@@ -565,6 +569,11 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 			version = moreSpecificVersion(version, versionString)
 		}
 
+		if ok, versionString := b.matchHeaderFingerprint(fingerprint, networkRequests, pageOrigin); ok {
+			matched = true
+			version = moreSpecificVersion(version, versionString)
+		}
+
 		if ok, versionString := b.matchScriptSrcFingerprint(fingerprint, networkRequests); ok {
 			matched = true
 			version = moreSpecificVersion(version, versionString)
@@ -590,6 +599,16 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 	addRuntimeBundleTechnologies(technologies, wappalyzerClient, originalFingerprints, pageBody, networkRequests, scriptBodies)
 
 	return technologies
+}
+
+func addHeadlessBodyTechnologies(technologies map[string]wappalyzer.AppInfo, wappalyzerClient *wappalyzer.Wappalyze, pageBody string) {
+	if pageBody == "" {
+		return
+	}
+
+	for match, data := range wappalyzerClient.FingerprintWithInfo(map[string][]string{}, []byte(pageBody)) {
+		technologies[match] = data
+	}
 }
 
 func addRuntimeTechnology(technologies map[string]wappalyzer.AppInfo, wappalyzerClient *wappalyzer.Wappalyze, originalFingerprints *wappalyzer.Fingerprints, app string, version string) {
@@ -839,6 +858,27 @@ return JSON.stringify(values);
 }
 
 func (b *Browser) collectRuntimeCookies(page *rod.Page) map[string]string {
+	cookies := b.collectRuntimeDocumentCookies(page)
+	pageOrigin := b.collectRuntimePageOrigin(page)
+	if pageOrigin == "" {
+		return cookies
+	}
+
+	browserCookies, err := page.Cookies([]string{pageOrigin})
+	if err != nil {
+		return cookies
+	}
+	for _, cookie := range browserCookies {
+		if cookie == nil || cookie.Name == "" {
+			continue
+		}
+		cookies[strings.ToLower(cookie.Name)] = strings.ToLower(cookie.Value)
+	}
+
+	return cookies
+}
+
+func (b *Browser) collectRuntimeDocumentCookies(page *rod.Page) map[string]string {
 	output, err := page.Eval(`() => document.cookie`)
 	if err != nil {
 		return map[string]string{}
@@ -1084,6 +1124,23 @@ func normalizeSameOriginURL(rawRequestURL string, pageOrigin string) (string, bo
 	return requestURL.String(), true
 }
 
+func normalizeNetworkHeaders(headers proto.NetworkHeaders) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	normalized := make(map[string]string, len(headers))
+	for name, value := range headers {
+		headerName := strings.ToLower(strings.TrimSpace(name))
+		if headerName == "" {
+			continue
+		}
+		normalized[headerName] = strings.ToLower(strings.TrimSpace(value.String()))
+	}
+
+	return normalized
+}
+
 func isLikelyJavaScriptURL(rawRequestURL string) bool {
 	parsedURL, err := url.Parse(rawRequestURL)
 	if err != nil {
@@ -1313,6 +1370,36 @@ func (b *Browser) matchCookieFingerprint(fingerprint *wappalyzer.Fingerprint, co
 		if ok, versionString := evaluateRuntimePattern(patternString, value); ok {
 			version = moreSpecificVersion(version, versionString)
 			return true, version
+		}
+	}
+
+	return false, ""
+}
+
+func (b *Browser) matchHeaderFingerprint(fingerprint *wappalyzer.Fingerprint, networkRequests []NetworkRequest, pageOrigin string) (bool, string) {
+	if len(fingerprint.Headers) == 0 || len(networkRequests) == 0 {
+		return false, ""
+	}
+
+	version := ""
+
+	for _, request := range networkRequests {
+		if pageOrigin != "" && !isSameOriginRequest(request.URL, pageOrigin) {
+			continue
+		}
+		if len(request.ResponseHeaders) == 0 {
+			continue
+		}
+
+		for headerName, patternString := range fingerprint.Headers {
+			value, ok := request.ResponseHeaders[strings.ToLower(headerName)]
+			if !ok {
+				continue
+			}
+			if ok, versionString := evaluateRuntimePattern(patternString, value); ok {
+				version = moreSpecificVersion(version, versionString)
+				return true, version
+			}
 		}
 	}
 

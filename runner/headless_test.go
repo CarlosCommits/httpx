@@ -1,6 +1,10 @@
 package runner
 
-import "testing"
+import (
+	"testing"
+
+	wappalyzer "github.com/projectdiscovery/wappalyzergo"
+)
 
 func TestHasReactBundleEvidence(t *testing.T) {
 	scriptBodies := []string{
@@ -117,5 +121,41 @@ func TestReadinessBlocksOnPendingSameOriginScript(t *testing.T) {
 	}
 	if onlyThirdPartyChallengeRequestsPending(requests, "https://example.com") {
 		t.Fatal("expected pending same-origin script to remain blocking")
+	}
+}
+
+func TestMatchHeaderFingerprintUsesSameOriginBrowserHeaders(t *testing.T) {
+	requests := []NetworkRequest{
+		{
+			URL:             "https://example.com/api/status",
+			StatusCode:      200,
+			ResponseHeaders: map[string]string{"x-powered-by": "express"},
+		},
+	}
+	fingerprint := &wappalyzer.Fingerprint{
+		Headers: map[string]string{"x-powered-by": "express"},
+	}
+
+	matched, _ := (&Browser{}).matchHeaderFingerprint(fingerprint, requests, "https://example.com")
+	if !matched {
+		t.Fatal("expected same-origin browser response header to match")
+	}
+}
+
+func TestMatchHeaderFingerprintIgnoresThirdPartyBrowserHeaders(t *testing.T) {
+	requests := []NetworkRequest{
+		{
+			URL:             "https://third-party.example/api/status",
+			StatusCode:      200,
+			ResponseHeaders: map[string]string{"x-powered-by": "express"},
+		},
+	}
+	fingerprint := &wappalyzer.Fingerprint{
+		Headers: map[string]string{"x-powered-by": "express"},
+	}
+
+	matched, _ := (&Browser{}).matchHeaderFingerprint(fingerprint, requests, "https://example.com")
+	if matched {
+		t.Fatal("expected third-party browser response header to be ignored")
 	}
 }
