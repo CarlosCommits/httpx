@@ -22,6 +22,26 @@ func TestHasReactBundleEvidenceRequiresReactPackageMarker(t *testing.T) {
 	}
 }
 
+func TestHasReactBundleEvidenceFromRuntimeSymbols(t *testing.T) {
+	scriptBodies := []string{
+		`var p=symbol.for("react.transitional.element"),r=symbol.for("react.portal"),e=symbol.for("react.fragment"),y=symbol.for("react.strict_mode"),p=symbol.for("react.profiler"),w=symbol.for("react.consumer"),m=symbol.for("react.context"),t=symbol.for("react.forward_ref"),i=symbol.for("react.suspense"),t=symbol.for("react.memo"),c=symbol.for("react.lazy");`,
+	}
+
+	if !hasReactBundleEvidence(scriptBodies) {
+		t.Fatal("expected React runtime symbol evidence to be detected")
+	}
+}
+
+func TestHasReactBundleEvidenceRequiresMultipleRuntimeSymbols(t *testing.T) {
+	scriptBodies := []string{
+		`const label = Symbol.for("react.fragment");`,
+	}
+
+	if hasReactBundleEvidence(scriptBodies) {
+		t.Fatal("expected partial React runtime symbol evidence to be ignored")
+	}
+}
+
 func TestHasViteBundleEvidenceFromDataVite(t *testing.T) {
 	body := `<style data-vite-theme="" data-inject-first=""></style>`
 

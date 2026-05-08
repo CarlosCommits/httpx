@@ -1146,17 +1146,53 @@ func isCloudflareChallengeURL(rawRequestURL string) bool {
 
 func hasReactBundleEvidence(scriptBodies []string) bool {
 	for _, body := range scriptBodies {
-		if !strings.Contains(body, "@license react") {
-			continue
-		}
-		if strings.Contains(body, "react.production.min.js") ||
-			strings.Contains(body, "react-dom.production.min.js") ||
-			strings.Contains(body, "react-jsx-runtime.production.min.js") {
+		if hasReactPackageBannerEvidence(body) || hasReactRuntimeSymbolEvidence(body) {
 			return true
 		}
 	}
 
 	return false
+}
+
+func hasReactPackageBannerEvidence(body string) bool {
+	if !strings.Contains(body, "@license react") {
+		return false
+	}
+
+	return strings.Contains(body, "react.production.min.js") ||
+		strings.Contains(body, "react-dom.production.min.js") ||
+		strings.Contains(body, "react-jsx-runtime.production.min.js")
+}
+
+func hasReactRuntimeSymbolEvidence(body string) bool {
+	normalizedBody := strings.ToLower(body)
+	if !strings.Contains(normalizedBody, `symbol.for("react.`) && !strings.Contains(normalizedBody, `symbol.for('react.`) {
+		return false
+	}
+
+	markers := []string{
+		"react.element",
+		"react.transitional.element",
+		"react.portal",
+		"react.fragment",
+		"react.strict_mode",
+		"react.profiler",
+		"react.consumer",
+		"react.context",
+		"react.forward_ref",
+		"react.suspense",
+		"react.memo",
+		"react.lazy",
+	}
+
+	matchCount := 0
+	for _, marker := range markers {
+		if strings.Contains(normalizedBody, marker) {
+			matchCount++
+		}
+	}
+
+	return matchCount >= 5
 }
 
 func hasViteBundleEvidence(pageBody string, networkRequests []NetworkRequest, scriptBodies []string) bool {
