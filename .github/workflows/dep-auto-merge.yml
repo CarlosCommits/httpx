@@ -1,26 +1,26 @@
-name: 🤖 dep auto merge
+name: Dependabot native auto-merge
 
 on:
   pull_request:
     branches:
       - dev
-  workflow_dispatch:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - ready_for_review
 
 permissions:
+  contents: write
   pull-requests: write
-  issues: write
-  repository-projects: write
 
 jobs:
-  automerge:
+  enable-auto-merge:
     runs-on: ubuntu-latest
-    if: github.actor == 'dependabot[bot]'
+    if: github.event.pull_request.user.login == 'dependabot[bot]'
     steps:
-      - uses: actions/checkout@v3
-        with:
-          token: ${{ secrets.DEPENDABOT_PAT }}
-
-      - uses: ahmadnassri/action-dependabot-auto-merge@v2
-        with:
-          github-token: ${{ secrets.DEPENDABOT_PAT }}
-          target: all
+      - name: Enable native auto-merge
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --auto --merge "$PR_URL"
