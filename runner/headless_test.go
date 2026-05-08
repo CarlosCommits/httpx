@@ -47,3 +47,55 @@ func TestHasViteBundleEvidenceRequiresMultipleSignals(t *testing.T) {
 		t.Fatal("expected lone module asset to be ignored")
 	}
 }
+
+func TestSameOriginScriptCandidatesIncludesStartedRequests(t *testing.T) {
+	body := `<script type="module" crossorigin src="/assets/index-DyXVzQOV.js"></script>`
+	requests := []NetworkRequest{
+		{URL: "https://example.com/assets/late.js", ResourceType: "Script", StatusCode: -1},
+		{URL: "https://cdn.example.net/vendor.js", ResourceType: "Script", StatusCode: 200},
+	}
+
+	got := sameOriginScriptCandidates(body, requests, "https://example.com")
+
+	want := map[string]bool{
+		"https://example.com/assets/index-DyXVzQOV.js": false,
+		"https://example.com/assets/late.js":           false,
+	}
+	for _, candidate := range got {
+		if _, ok := want[candidate]; ok {
+			want[candidate] = true
+		}
+		if candidate == "https://cdn.example.net/vendor.js" {
+			t.Fatal("expected third-party script to be excluded")
+		}
+	}
+	for candidate, found := range want {
+		if !found {
+			t.Fatalf("expected candidate %s", candidate)
+		}
+	}
+}
+
+func TestReadinessAllowsOnlyThirdPartyChallengePending(t *testing.T) {
+	requests := []NetworkRequest{
+		{URL: "https://example.com/assets/index.js", ResourceType: "Script", StatusCode: 200},
+		{URL: "https://challenges.cloudflare.com/cdn-cgi/challenge-platform/test", ResourceType: "XHR", StatusCode: -1},
+	}
+
+	if !onlyThirdPartyChallengeRequestsPending(requests, "https://example.com") {
+		t.Fatal("expected Cloudflare challenge request to be treated as non-blocking")
+	}
+}
+
+func TestReadinessBlocksOnPendingSameOriginScript(t *testing.T) {
+	requests := []NetworkRequest{
+		{URL: "https://example.com/assets/index.js", ResourceType: "Script", StatusCode: -1},
+	}
+
+	if !hasPendingSameOriginScripts(requests, "https://example.com") {
+		t.Fatal("expected pending same-origin script to block readiness")
+	}
+	if onlyThirdPartyChallengeRequestsPending(requests, "https://example.com") {
+		t.Fatal("expected pending same-origin script to remain blocking")
+	}
+}

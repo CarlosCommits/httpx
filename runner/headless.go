@@ -4,10 +4,13 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
 	"net/url"
 	"os"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/go-rod/rod"
@@ -16,9 +19,7 @@ import (
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/pkg/errors"
 	fileutil "github.com/projectdiscovery/utils/file"
-	mapsutil "github.com/projectdiscovery/utils/maps"
 	osutils "github.com/projectdiscovery/utils/os"
-	sliceutil "github.com/projectdiscovery/utils/slice"
 	stringsutil "github.com/projectdiscovery/utils/strings"
 	wappalyzer "github.com/projectdiscovery/wappalyzergo"
 )
@@ -30,6 +31,101 @@ type NetworkRequest struct {
 	ResourceType string
 	StatusCode   int
 	ErrorType    string
+}
+
+type headlessNetworkTracker struct {
+	mu        sync.Mutex
+	requests  map[string]*NetworkRequest
+	order     []string
+	lastEvent time.Time
+}
+
+func newHeadlessNetworkTracker() *headlessNetworkTracker {
+	return &headlessNetworkTracker{
+		requests:  make(map[string]*NetworkRequest),
+		lastEvent: time.Now(),
+	}
+}
+
+func (t *headlessNetworkTracker) start(request NetworkRequest) {
+	if request.RequestID == "" {
+		return
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	if _, ok := t.requests[request.RequestID]; !ok {
+		t.order = append(t.order, request.RequestID)
+	}
+	requestCopy := request
+	t.requests[request.RequestID] = &requestCopy
+	t.lastEvent = time.Now()
+}
+
+func (t *headlessNetworkTracker) response(requestID string, status int, resourceType string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	request, ok := t.requests[requestID]
+	if !ok {
+		return
+	}
+	request.StatusCode = status
+	if request.ResourceType == "" {
+		request.ResourceType = resourceType
+	}
+	t.lastEvent = time.Now()
+}
+
+func (t *headlessNetworkTracker) finish(requestID string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	request, ok := t.requests[requestID]
+	if !ok {
+		return
+	}
+	if request.StatusCode > 0 {
+		request.ErrorType = ""
+	}
+	t.lastEvent = time.Now()
+}
+
+func (t *headlessNetworkTracker) fail(requestID string, errorType string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	request, ok := t.requests[requestID]
+	if !ok {
+		return
+	}
+	request.StatusCode = 0
+	request.ErrorType = errorType
+	t.lastEvent = time.Now()
+}
+
+func (t *headlessNetworkTracker) snapshot() []NetworkRequest {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	requests := make([]NetworkRequest, 0, len(t.order))
+	for _, requestID := range t.order {
+		request, ok := t.requests[requestID]
+		if !ok {
+			continue
+		}
+		requests = append(requests, *request)
+	}
+
+	return requests
+}
+
+func (t *headlessNetworkTracker) quietFor(duration time.Duration) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	return time.Since(t.lastEvent) >= duration
 }
 
 type runtimeDOMValue struct {
@@ -51,6 +147,13 @@ var (
 	viteStylesheetPattern      = regexp.MustCompile(`<link\b[^>]*\brel=["']stylesheet["'][^>]*\bhref=["'][^"']*/assets/[^"']+\.css["']`)
 	viteAssetScriptPathPattern = regexp.MustCompile(`/assets/[^/?#]+\.js(?:[?#].*)?$`)
 	viteAssetStylePathPattern  = regexp.MustCompile(`/assets/[^/?#]+\.css(?:[?#].*)?$`)
+	scriptSrcPattern           = regexp.MustCompile(`<script\b[^>]*\bsrc=["']([^"']+)["']`)
+)
+
+const (
+	headlessReadinessTimeout       = 20 * time.Second
+	headlessReadinessPollInterval  = 250 * time.Millisecond
+	headlessReadinessQuietDuration = 750 * time.Millisecond
 )
 
 type HeadlessVisitOptions struct {
@@ -156,13 +259,13 @@ func NewBrowser(proxy string, useLocal bool, optionalArgs map[string]string) (*B
 }
 
 func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (*HeadlessVisitResult, error) {
-	page, networkRequests, err := b.setupPageAndNavigate(url, options.Timeout, options.Headers, options.JSCodes)
+	page, networkTracker, err := b.setupPageAndNavigate(url, options.Timeout, options.Headers, options.JSCodes)
 	if err != nil {
 		return nil, err
 	}
 	defer b.closePage(page)
 
-	screenshot, body, err := b.capturePageArtifacts(page, options.Idle, options.FullPage, options.CaptureScreenshot)
+	screenshot, body, networkRequests, err := b.capturePageArtifacts(page, networkTracker, options.Idle, options.FullPage, options.CaptureScreenshot, options.DetectRuntimeTechnology)
 	if err != nil {
 		return nil, err
 	}
@@ -181,63 +284,42 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 }
 
 // setupPageAndNavigate opens a page, performs all adaptive actions including JS injection
-func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, headers []string, jsCodes []string) (*rod.Page, []NetworkRequest, error) {
+func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, headers []string, jsCodes []string) (*rod.Page, *headlessNetworkTracker, error) {
 	page, err := b.engine.Page(proto.TargetCreateTarget{})
 	if err != nil {
-		return nil, []NetworkRequest{}, err
+		return nil, nil, err
 	}
 
 	// Enable network
 	page.EnableDomain(proto.NetworkEnable{})
 
-	networkRequests := sliceutil.NewSyncSlice[NetworkRequest]()
-	requestsMap := mapsutil.NewSyncLockMap[string, *NetworkRequest]()
+	networkTracker := newHeadlessNetworkTracker()
 
 	// Intercept outbound requests
 	go page.EachEvent(func(e *proto.NetworkRequestWillBeSent) {
 		if !stringsutil.HasPrefixAnyI(e.Request.URL, "http://", "https://") {
 			return
 		}
-		req := &NetworkRequest{
+		networkTracker.start(NetworkRequest{
 			RequestID:    string(e.RequestID),
 			URL:          e.Request.URL,
 			Method:       e.Request.Method,
 			ResourceType: string(e.Type),
 			StatusCode:   -1,
 			ErrorType:    "QUIT_BEFORE_RESOURCE_LOADING_END",
-		}
-		_ = requestsMap.Set(string(e.RequestID), req)
+		})
 	})()
 	// Intercept inbound responses
 	go page.EachEvent(func(e *proto.NetworkResponseReceived) {
-		if requestsMap.Has(string(e.RequestID)) {
-			req, _ := requestsMap.Get(string(e.RequestID))
-			req.StatusCode = e.Response.Status
-			if req.ResourceType == "" {
-				req.ResourceType = string(e.Type)
-			}
-		}
+		networkTracker.response(string(e.RequestID), e.Response.Status, string(e.Type))
 	})()
 	// Intercept network end requests
 	go page.EachEvent(func(e *proto.NetworkLoadingFinished) {
-		if requestsMap.Has(string(e.RequestID)) {
-			req, _ := requestsMap.Get(string(e.RequestID))
-			if req.StatusCode > 0 {
-				req.ErrorType = ""
-			}
-			networkRequests.Append(*req)
-		}
+		networkTracker.finish(string(e.RequestID))
 	})()
 	// Intercept failed request
 	go page.EachEvent(func(e *proto.NetworkLoadingFailed) {
-		if requestsMap.Has(string(e.RequestID)) {
-			req, _ := requestsMap.Get(string(e.RequestID))
-			req.StatusCode = 0 // mark to zero
-			req.ErrorType = getSimpleErrorType(e.ErrorText, string(e.Type), string(e.BlockedReason))
-			if stringsutil.HasPrefixAnyI(req.URL, "http://", "https://") {
-				networkRequests.Append(*req)
-			}
-		}
+		networkTracker.fail(string(e.RequestID), getSimpleErrorType(e.ErrorText, string(e.Type), string(e.BlockedReason)))
 	})()
 
 	// Handle any popup dialogs
@@ -261,43 +343,97 @@ func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, header
 	page = page.Timeout(timeout)
 
 	if err := page.Navigate(url); err != nil {
-		return page, networkRequests.Slice, err
+		return page, networkTracker, err
 	}
 
 	if len(jsCodes) > 0 {
 		_, err := b.ExecuteJavascriptCodesWithPage(page, jsCodes)
 		if err != nil {
-			return page, networkRequests.Slice, err
+			return page, networkTracker, err
 		}
 	}
 
 	page.Timeout(5 * time.Second).WaitNavigation(proto.PageLifecycleEventNameFirstMeaningfulPaint)()
 
-	return page, networkRequests.Slice, nil
+	return page, networkTracker, nil
 }
 
 // capturePageArtifacts waits for the page and returns rendered HTML with optional screenshot bytes.
-func (b *Browser) capturePageArtifacts(page *rod.Page, idle time.Duration, fullPage bool, captureScreenshot bool) ([]byte, string, error) {
+func (b *Browser) capturePageArtifacts(page *rod.Page, networkTracker *headlessNetworkTracker, idle time.Duration, fullPage bool, captureScreenshot bool, waitForRuntimeReadiness bool) ([]byte, string, []NetworkRequest, error) {
 	if err := page.WaitLoad(); err != nil {
-		return nil, "", err
+		return nil, "", nil, err
 	}
 	_ = page.WaitIdle(idle)
+
+	if waitForRuntimeReadiness {
+		b.waitForHeadlessReadiness(page, networkTracker)
+	}
 
 	var screenshot []byte
 	if captureScreenshot {
 		var err error
 		screenshot, err = page.Screenshot(fullPage, &proto.PageCaptureScreenshot{})
 		if err != nil {
-			return nil, "", err
+			return nil, "", nil, err
 		}
 	}
 
 	body, err := page.HTML()
 	if err != nil {
-		return screenshot, "", err
+		return screenshot, "", networkTracker.snapshot(), err
 	}
 
-	return screenshot, body, nil
+	return screenshot, body, networkTracker.snapshot(), nil
+}
+
+func (b *Browser) waitForHeadlessReadiness(page *rod.Page, networkTracker *headlessNetworkTracker) {
+	if networkTracker == nil {
+		return
+	}
+
+	pageOrigin := b.collectRuntimePageOrigin(page)
+	deadline := time.Now().Add(headlessReadinessTimeout)
+
+	for time.Now().Before(deadline) {
+		body, _ := page.HTML()
+		networkRequests := networkTracker.snapshot()
+		scriptCandidates := sameOriginScriptCandidates(body, networkRequests, pageOrigin)
+
+		if len(scriptCandidates) > 0 && allScriptCandidatesCompleted(scriptCandidates, networkRequests) {
+			return
+		}
+
+		quiet := networkTracker.quietFor(headlessReadinessQuietDuration)
+		if quiet && !hasPendingSameOriginScripts(networkRequests, pageOrigin) {
+			if b.hasHydratedAppRoot(page) || onlyThirdPartyChallengeRequestsPending(networkRequests, pageOrigin) {
+				return
+			}
+		}
+
+		time.Sleep(headlessReadinessPollInterval)
+	}
+}
+
+func (b *Browser) hasHydratedAppRoot(page *rod.Page) bool {
+	output, err := page.Eval(`() => {
+const roots = [
+  document.querySelector("#root"),
+  document.querySelector("#app"),
+  document.querySelector("[data-reactroot]")
+].filter(Boolean);
+return roots.some((root) => root.children.length > 0 || (root.textContent || "").trim().length > 20);
+}`)
+	if err != nil {
+		return false
+	}
+
+	rawValue := fmt.Sprint(output.Value)
+	var hydrated bool
+	if err := json.Unmarshal([]byte(rawValue), &hydrated); err != nil {
+		return rawValue == "true"
+	}
+
+	return hydrated
 }
 
 // closePage closes the page and performs cleanup
@@ -392,7 +528,7 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 	domValues := b.collectRuntimeDOMValues(page, originalFingerprints)
 	browserCookies := b.collectRuntimeCookies(page)
 	pageOrigin := b.collectRuntimePageOrigin(page)
-	scriptBodies := b.collectRuntimeResourceBodies(page, networkRequests, pageOrigin, isLikelyScriptRequest)
+	scriptBodies := b.collectRuntimeScriptResourceBodies(page, networkRequests, pageOrigin, pageBody)
 	cssBodies := b.collectRuntimeResourceBodies(page, networkRequests, pageOrigin, isLikelyCSSRequest)
 
 	for app, fingerprint := range originalFingerprints.Apps {
@@ -742,6 +878,11 @@ func (b *Browser) collectRuntimePageOrigin(page *rod.Page) string {
 }
 
 func (b *Browser) collectRuntimeResourceBodies(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, predicate func(NetworkRequest) bool) []string {
+	bodies, _ := b.collectRuntimeResourceBodiesWithURLs(page, networkRequests, pageOrigin, predicate)
+	return bodies
+}
+
+func (b *Browser) collectRuntimeResourceBodiesWithURLs(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, predicate func(NetworkRequest) bool) ([]string, map[string]struct{}) {
 	const (
 		maxResources      = 20
 		maxResourceBytes  = 2 * 1024 * 1024
@@ -750,6 +891,7 @@ func (b *Browser) collectRuntimeResourceBodies(page *rod.Page, networkRequests [
 
 	bodies := make([]string, 0)
 	seen := map[string]struct{}{}
+	captured := map[string]struct{}{}
 	totalBytes := 0
 
 	for _, request := range networkRequests {
@@ -791,6 +933,65 @@ func (b *Browser) collectRuntimeResourceBodies(page *rod.Page, networkRequests [
 		}
 
 		bodies = append(bodies, strings.ToLower(body))
+		captured[strings.ToLower(request.URL)] = struct{}{}
+		totalBytes += len(body)
+	}
+
+	return bodies, captured
+}
+
+func (b *Browser) collectRuntimeScriptResourceBodies(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, pageBody string) []string {
+	bodies, capturedURLs := b.collectRuntimeResourceBodiesWithURLs(page, networkRequests, pageOrigin, isLikelyScriptRequest)
+	fallbackBodies := fetchSameOriginScriptBodies(pageBody, networkRequests, pageOrigin, capturedURLs)
+	return append(bodies, fallbackBodies...)
+}
+
+func fetchSameOriginScriptBodies(pageBody string, networkRequests []NetworkRequest, pageOrigin string, capturedURLs map[string]struct{}) []string {
+	const (
+		maxFetches        = 10
+		maxResourceBytes  = 2 * 1024 * 1024
+		maxTotalBodyBytes = 8 * 1024 * 1024
+	)
+
+	scriptCandidates := sameOriginScriptCandidates(pageBody, networkRequests, pageOrigin)
+	if len(scriptCandidates) == 0 {
+		return nil
+	}
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	bodies := make([]string, 0)
+	totalBytes := 0
+
+	for _, scriptURL := range scriptCandidates {
+		if len(bodies) >= maxFetches || totalBytes >= maxTotalBodyBytes {
+			break
+		}
+		if _, ok := capturedURLs[strings.ToLower(scriptURL)]; ok {
+			continue
+		}
+
+		request, err := http.NewRequest(http.MethodGet, scriptURL, nil)
+		if err != nil {
+			continue
+		}
+		request.Header.Set("Accept", "application/javascript,text/javascript,*/*;q=0.8")
+		request.Header.Set("Referer", pageOrigin+"/")
+		request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+
+		response, err := client.Do(request)
+		if err != nil {
+			continue
+		}
+		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResourceBytes+1))
+		_ = response.Body.Close()
+		if readErr != nil || response.StatusCode != http.StatusOK || len(body) == 0 || len(body) > maxResourceBytes {
+			continue
+		}
+		if totalBytes+len(body) > maxTotalBodyBytes {
+			continue
+		}
+
+		bodies = append(bodies, strings.ToLower(string(body)))
 		totalBytes += len(body)
 	}
 
@@ -822,6 +1023,125 @@ func isLikelyCSSRequest(request NetworkRequest) bool {
 
 	return resourceType == "stylesheet" ||
 		strings.Contains(url, ".css")
+}
+
+func sameOriginScriptCandidates(pageBody string, networkRequests []NetworkRequest, pageOrigin string) []string {
+	candidates := make([]string, 0)
+	seen := map[string]struct{}{}
+
+	addCandidate := func(rawURL string) {
+		normalizedURL, ok := normalizeSameOriginURL(rawURL, pageOrigin)
+		if !ok || !isLikelyJavaScriptURL(normalizedURL) {
+			return
+		}
+		if _, ok := seen[normalizedURL]; ok {
+			return
+		}
+		seen[normalizedURL] = struct{}{}
+		candidates = append(candidates, normalizedURL)
+	}
+
+	for _, match := range scriptSrcPattern.FindAllStringSubmatch(pageBody, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		addCandidate(match[1])
+	}
+
+	for _, request := range networkRequests {
+		if isLikelyScriptRequest(request) {
+			addCandidate(request.URL)
+		}
+	}
+
+	return candidates
+}
+
+func normalizeSameOriginURL(rawRequestURL string, pageOrigin string) (string, bool) {
+	if pageOrigin == "" || rawRequestURL == "" {
+		return "", false
+	}
+
+	baseURL, err := url.Parse(pageOrigin)
+	if err != nil || baseURL.Scheme == "" || baseURL.Host == "" {
+		return "", false
+	}
+
+	requestURL, err := url.Parse(rawRequestURL)
+	if err != nil {
+		return "", false
+	}
+	if requestURL.Scheme == "" && requestURL.Host == "" {
+		requestURL = baseURL.ResolveReference(requestURL)
+	}
+	if requestURL.Scheme == "" || requestURL.Host == "" {
+		return "", false
+	}
+	if strings.ToLower(requestURL.Scheme+"://"+requestURL.Host) != pageOrigin {
+		return "", false
+	}
+
+	return requestURL.String(), true
+}
+
+func isLikelyJavaScriptURL(rawRequestURL string) bool {
+	parsedURL, err := url.Parse(rawRequestURL)
+	if err != nil {
+		return false
+	}
+	path := strings.ToLower(parsedURL.Path)
+	return strings.HasSuffix(path, ".js") || strings.HasSuffix(path, ".mjs")
+}
+
+func allScriptCandidatesCompleted(scriptCandidates []string, networkRequests []NetworkRequest) bool {
+	completed := map[string]struct{}{}
+	for _, request := range networkRequests {
+		if request.StatusCode == http.StatusOK && isLikelyScriptRequest(request) {
+			completed[strings.ToLower(request.URL)] = struct{}{}
+		}
+	}
+
+	for _, scriptURL := range scriptCandidates {
+		if _, ok := completed[strings.ToLower(scriptURL)]; !ok {
+			return false
+		}
+	}
+
+	return true
+}
+
+func hasPendingSameOriginScripts(networkRequests []NetworkRequest, pageOrigin string) bool {
+	for _, request := range networkRequests {
+		if request.StatusCode != -1 || !isLikelyScriptRequest(request) {
+			continue
+		}
+		if pageOrigin == "" || isSameOriginRequest(request.URL, pageOrigin) {
+			return true
+		}
+	}
+
+	return false
+}
+
+func onlyThirdPartyChallengeRequestsPending(networkRequests []NetworkRequest, pageOrigin string) bool {
+	hasPending := false
+	for _, request := range networkRequests {
+		if request.StatusCode != -1 {
+			continue
+		}
+		hasPending = true
+		if isSameOriginRequest(request.URL, pageOrigin) && !isCloudflareChallengeURL(request.URL) {
+			return false
+		}
+	}
+
+	return hasPending
+}
+
+func isCloudflareChallengeURL(rawRequestURL string) bool {
+	urlLower := strings.ToLower(rawRequestURL)
+	return strings.Contains(urlLower, "/cdn-cgi/challenge-platform/") ||
+		strings.Contains(urlLower, "challenges.cloudflare.com")
 }
 
 func hasReactBundleEvidence(scriptBodies []string) bool {
