@@ -1,0 +1,129 @@
+name: Sync upstream dev
+
+on:
+  schedule:
+    - cron: "17 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+env:
+  UPSTREAM_REPOSITORY: projectdiscovery/httpx
+  BASE_BRANCH: dev
+  SYNC_BRANCH: automation/sync-upstream-dev
+
+jobs:
+  sync:
+    name: Create upstream sync PR
+    runs-on: ubuntu-latest
+    outputs:
+      has_changes: ${{ steps.sync.outputs.has_changes }}
+      pr_number: ${{ steps.pr.outputs.pr_number }}
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+          token: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Merge upstream dev
+        id: sync
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch origin "${BASE_BRANCH}"
+          git fetch upstream "${BASE_BRANCH}"
+          git switch -C "${SYNC_BRANCH}" "origin/${BASE_BRANCH}"
+
+          if git merge-base --is-ancestor "upstream/${BASE_BRANCH}" HEAD; then
+            echo "Fork ${BASE_BRANCH} already contains upstream/${BASE_BRANCH}."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git merge --no-edit "upstream/${BASE_BRANCH}"
+
+          if [ "$(git rev-list --count "origin/${BASE_BRANCH}..HEAD")" = "0" ]; then
+            echo "No sync commits to push."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          git push --force-with-lease origin "HEAD:${SYNC_BRANCH}"
+          echo "has_changes=true" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update pull request
+        id: pr
+        if: steps.sync.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+        run: |
+          pr_number="$(gh pr list --base "${BASE_BRANCH}" --head "${SYNC_BRANCH}" --json number --jq '.[0].number')"
+
+          if [ -z "$pr_number" ]; then
+            pr_url="$(gh pr create \
+              --base "${BASE_BRANCH}" \
+              --head "${SYNC_BRANCH}" \
+              --title "chore: sync upstream dev" \
+              --body "Automated merge of projectdiscovery/httpx dev into this fork.")"
+            pr_number="$(gh pr view "$pr_url" --json number --jq '.number')"
+          else
+            gh pr edit "$pr_number" \
+              --title "chore: sync upstream dev" \
+              --body "Automated merge of projectdiscovery/httpx dev into this fork."
+          fi
+
+          echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Validate sync (${{ matrix.os }})
+    needs: sync
+    if: needs.sync.outputs.has_changes == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - name: Checkout sync branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.SYNC_BRANCH }}
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build httpx
+        run: go build .
+        working-directory: cmd/httpx
+
+      - name: Test
+        run: go test ./...
+
+  merge:
+    name: Merge validated sync PR
+    needs: [sync, validate]
+    if: needs.sync.outputs.has_changes == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge PR
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          PR_NUMBER: ${{ needs.sync.outputs.pr_number }}
+        run: |
+          gh pr merge "$PR_NUMBER" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --merge \
+            --subject "chore: sync upstream dev" \
+            --body "Automated upstream dev sync after build and tests passed."
