@@ -150,6 +150,8 @@ var (
 	viteAssetScriptPathPattern = regexp.MustCompile(`/assets/[^/?#]+\.js(?:[?#].*)?$`)
 	viteAssetStylePathPattern  = regexp.MustCompile(`/assets/[^/?#]+\.css(?:[?#].*)?$`)
 	scriptSrcPattern           = regexp.MustCompile(`<script\b[^>]*\bsrc=["']([^"']+)["']`)
+	modulePreloadHrefPattern   = regexp.MustCompile(`<link\b[^>]*\brel=["']modulepreload["'][^>]*\bhref=["']([^"']+)["']`)
+	dynamicImportPattern       = regexp.MustCompile(`import\(["']([^"']+\.m?js(?:\?[^"']*)?)["']\)`)
 )
 
 const (
@@ -596,6 +598,12 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, app, version)
 	}
 
+	if b.hasReactRuntimeDOMInternalEvidence(page) {
+		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "React", "")
+	}
+	if b.hasTanStackRouterRuntimeEvidence(page) {
+		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "TanStack Router", "")
+	}
 	addRuntimeBundleTechnologies(technologies, wappalyzerClient, originalFingerprints, pageBody, networkRequests, scriptBodies)
 
 	return technologies
@@ -636,6 +644,15 @@ func addRuntimeBundleTechnologies(technologies map[string]wappalyzer.AppInfo, wa
 	}
 	if hasViteBundleEvidence(pageBody, networkRequests, scriptBodies) {
 		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "Vite", "")
+	}
+	if hasTanStackRouterBundleEvidence(pageBody, scriptBodies) {
+		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "TanStack Router", "")
+	}
+	if hasTanStackStartBundleEvidence(pageBody, scriptBodies) {
+		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "TanStack Start", "")
+	}
+	if hasTanStackQueryBundleEvidence(scriptBodies) {
+		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "TanStack Query", "")
 	}
 }
 
@@ -1088,6 +1105,20 @@ func sameOriginScriptCandidates(pageBody string, networkRequests []NetworkReques
 		addCandidate(match[1])
 	}
 
+	for _, match := range modulePreloadHrefPattern.FindAllStringSubmatch(pageBody, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		addCandidate(match[1])
+	}
+
+	for _, match := range dynamicImportPattern.FindAllStringSubmatch(pageBody, -1) {
+		if len(match) < 2 {
+			continue
+		}
+		addCandidate(match[1])
+	}
+
 	for _, request := range networkRequests {
 		if isLikelyScriptRequest(request) {
 			addCandidate(request.URL)
@@ -1223,7 +1254,9 @@ func hasReactPackageBannerEvidence(body string) bool {
 
 func hasReactRuntimeSymbolEvidence(body string) bool {
 	normalizedBody := strings.ToLower(body)
-	if !strings.Contains(normalizedBody, `symbol.for("react.`) && !strings.Contains(normalizedBody, `symbol.for('react.`) {
+	if !strings.Contains(normalizedBody, `symbol.for("react.`) &&
+		!strings.Contains(normalizedBody, `symbol.for('react.`) &&
+		!strings.Contains(normalizedBody, "symbol.for(`react.") {
 		return false
 	}
 
@@ -1250,6 +1283,47 @@ func hasReactRuntimeSymbolEvidence(body string) bool {
 	}
 
 	return matchCount >= 5
+}
+
+func (b *Browser) hasReactRuntimeDOMInternalEvidence(page *rod.Page) bool {
+	output, err := page.Eval(`() => {
+const prefixes = ["__reactFiber$", "__reactProps$", "__reactContainer$"];
+const selectors = ["body", "#root", "#app", "#__next", "body > div", "[data-reactroot]"];
+const elements = new Set();
+for (const selector of selectors) {
+  for (const element of document.querySelectorAll(selector)) {
+    elements.add(element);
+  }
+}
+let visited = 0;
+const walker = document.createTreeWalker(document.body || document.documentElement, NodeFilter.SHOW_ELEMENT);
+while (visited < 500) {
+  const element = walker.nextNode();
+  if (!element) break;
+  elements.add(element);
+  visited++;
+}
+for (const element of elements) {
+  if (Object.getOwnPropertyNames(element).some((name) => prefixes.some((prefix) => name.startsWith(prefix)))) {
+    return true;
+  }
+}
+return false;
+}`)
+	if err != nil {
+		return false
+	}
+
+	return strings.EqualFold(fmt.Sprint(output.Value), "true")
+}
+
+func (b *Browser) hasTanStackRouterRuntimeEvidence(page *rod.Page) bool {
+	output, err := page.Eval(`() => Boolean(window.__TSR_ROUTER__)`)
+	if err != nil {
+		return false
+	}
+
+	return strings.EqualFold(fmt.Sprint(output.Value), "true")
 }
 
 func hasViteBundleEvidence(pageBody string, networkRequests []NetworkRequest, scriptBodies []string) bool {
@@ -1301,6 +1375,39 @@ func hasViteModulePreloadEvidence(body string, scriptBodies []string) bool {
 
 	for _, scriptBody := range scriptBodies {
 		if strings.Contains(scriptBody, "modulepreload") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasTanStackRouterBundleEvidence(pageBody string, scriptBodies []string) bool {
+	for _, body := range append([]string{pageBody}, scriptBodies...) {
+		normalizedBody := strings.ToLower(body)
+		if strings.Contains(normalizedBody, "$_tsr.router") && strings.Contains(normalizedBody, "tsr-scroll-restoration") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasTanStackStartBundleEvidence(pageBody string, scriptBodies []string) bool {
+	for _, body := range append([]string{pageBody}, scriptBodies...) {
+		normalizedBody := strings.ToLower(body)
+		if strings.Contains(normalizedBody, "$_tsr.router") && strings.Contains(normalizedBody, "tsr-stream-barrier") {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasTanStackQueryBundleEvidence(scriptBodies []string) bool {
+	for _, body := range scriptBodies {
+		normalizedBody := strings.ToLower(body)
+		if strings.Contains(normalizedBody, "@tanstack/react-query") || strings.Contains(normalizedBody, "@tanstack/query-core") {
 			return true
 		}
 	}
