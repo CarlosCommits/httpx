@@ -1,7 +1,7 @@
-name: Dependabot native auto-merge
+name: Trusted PR auto-merge
 
 on:
-  pull_request:
+  pull_request_target:
     branches:
       - dev
     types:
@@ -17,7 +17,7 @@ permissions:
 jobs:
   enable-auto-merge:
     runs-on: ubuntu-latest
-    if: github.event.pull_request.user.login == 'dependabot[bot]'
+    if: contains(fromJSON('["CarlosCommits", "dependabot[bot]", "github-actions[bot]"]'), github.event.pull_request.user.login)
     steps:
       - name: Enable native auto-merge
         env:
