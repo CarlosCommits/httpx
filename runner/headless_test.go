@@ -1,8 +1,6 @@
 package runner
 
 import (
-	"os"
-	"path/filepath"
 	"testing"
 
 	wappalyzer "github.com/projectdiscovery/wappalyzergo"
@@ -131,8 +129,7 @@ func TestHasViteBundleEvidenceFromDataVite(t *testing.T) {
 func newTestCustomWappalyzerClient(t *testing.T) *wappalyzer.Wappalyze {
 	t.Helper()
 
-	fingerprintPath := filepath.Join(t.TempDir(), "fingerprints.json")
-	fingerprints := `{
+	fingerprintPath := writeCustomFingerprintFile(t, `{
   "apps": {
     "TanStack Router": {
       "cats": [12],
@@ -147,13 +144,9 @@ func newTestCustomWappalyzerClient(t *testing.T) *wappalyzer.Wappalyze {
       "description": "TanStack Query"
     }
   }
-}`
+}`)
 
-	if err := os.WriteFile(fingerprintPath, []byte(fingerprints), 0o600); err != nil {
-		t.Fatalf("failed to write custom fingerprints: %v", err)
-	}
-
-	wappalyzerClient, err := wappalyzer.NewFromFile(fingerprintPath, true, true)
+	wappalyzerClient, err := newWappalyzerClient(fingerprintPath)
 	if err != nil {
 		t.Fatalf("expected custom wappalyzer client to initialize: %v", err)
 	}
