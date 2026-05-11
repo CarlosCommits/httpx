@@ -30,5 +30,8 @@ jobs:
         run: go build .
         working-directory: cmd/httpx
 
+      - name: Stackray contract tests
+        run: go test ./runner -run TestStackrayContract -count=1
+
       - name: Test
         run: go test ./...

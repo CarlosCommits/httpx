@@ -8,6 +8,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  issues: write
 
 env:
   UPSTREAM_REPOSITORY: projectdiscovery/httpx
@@ -21,6 +22,8 @@ jobs:
     outputs:
       has_changes: ${{ steps.sync.outputs.has_changes }}
       pr_number: ${{ steps.pr.outputs.pr_number }}
+      risky_sync: ${{ steps.sync.outputs.risky_sync }}
+      changed_files: ${{ steps.sync.outputs.changed_files }}
     steps:
       - name: Checkout fork
         uses: actions/checkout@v4
@@ -56,15 +59,53 @@ jobs:
             exit 0
           fi
 
+          changed_files="$(git diff --name-only "origin/${BASE_BRANCH}..HEAD")"
+          risky_sync=false
+          if printf '%s\n' "$changed_files" | grep -E '^(runner/|common/httpx/|cmd/httpx/|go\.mod|go\.sum)' >/dev/null; then
+            risky_sync=true
+          fi
+          if printf '%s\n' "$changed_files" | grep -Ei '(wappalyzer|fingerprint|headless|tech)' >/dev/null; then
+            risky_sync=true
+          fi
+
           git push --force-with-lease origin "HEAD:${SYNC_BRANCH}"
           echo "has_changes=true" >> "$GITHUB_OUTPUT"
+          echo "risky_sync=${risky_sync}" >> "$GITHUB_OUTPUT"
+          {
+            echo "changed_files<<EOF"
+            printf '%s\n' "$changed_files"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Create or update pull request
         id: pr
         if: steps.sync.outputs.has_changes == 'true'
         env:
           GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          RISKY_SYNC: ${{ steps.sync.outputs.risky_sync }}
+          CHANGED_FILES: ${{ steps.sync.outputs.changed_files }}
         run: |
+          gh label create upstream-sync \
+            --color "0E8A16" \
+            --description "Automated upstream synchronization" || true
+          gh label create needs-review \
+            --color "D93F0B" \
+            --description "Requires human review before merge" || true
+
+          body_file="$(mktemp)"
+          {
+            echo "Automated merge of projectdiscovery/httpx dev into this fork."
+            echo
+            echo "- Upstream: ${UPSTREAM_REPOSITORY}:${BASE_BRANCH}"
+            echo "- Base branch: ${BASE_BRANCH}"
+            echo "- Risk-sensitive files changed: ${RISKY_SYNC}"
+            echo
+            echo "Changed files:"
+            echo '```'
+            printf '%s\n' "${CHANGED_FILES}"
+            echo '```'
+          } > "$body_file"
+
           pr_number="$(gh pr list --base "${BASE_BRANCH}" --head "${SYNC_BRANCH}" --json number --jq '.[0].number')"
 
           if [ -z "$pr_number" ]; then
@@ -72,12 +113,17 @@ jobs:
               --base "${BASE_BRANCH}" \
               --head "${SYNC_BRANCH}" \
               --title "chore: sync upstream dev" \
-              --body "Automated merge of projectdiscovery/httpx dev into this fork.")"
+              --body-file "$body_file")"
             pr_number="$(gh pr view "$pr_url" --json number --jq '.number')"
           else
             gh pr edit "$pr_number" \
               --title "chore: sync upstream dev" \
-              --body "Automated merge of projectdiscovery/httpx dev into this fork."
+              --body-file "$body_file"
+          fi
+
+          gh pr edit "$pr_number" --add-label upstream-sync
+          if [ "${RISKY_SYNC}" = "true" ]; then
+            gh pr edit "$pr_number" --add-label needs-review
           fi
 
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
@@ -108,13 +154,16 @@ jobs:
         run: go build .
         working-directory: cmd/httpx
 
+      - name: Stackray contract tests
+        run: go test ./runner -run TestStackrayContract -count=1
+
       - name: Test
         run: go test ./...
 
   merge:
     name: Merge validated sync PR
     needs: [sync, validate]
-    if: needs.sync.outputs.has_changes == 'true'
+    if: needs.sync.outputs.has_changes == 'true' && needs.sync.outputs.risky_sync != 'true'
     runs-on: ubuntu-latest
     steps:
       - name: Merge PR
@@ -127,3 +176,42 @@ jobs:
             --merge \
             --subject "chore: sync upstream dev" \
             --body "Automated upstream dev sync after build and tests passed."
+
+  report-failure:
+    name: Report blocked upstream sync
+    needs: [sync, validate, merge]
+    if: always() && (needs.sync.result == 'failure' || needs.validate.result == 'failure' || needs.merge.result == 'failure')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create or update blocked sync issue
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          TITLE: Upstream httpx sync blocked
+          SYNC_RESULT: ${{ needs.sync.result }}
+          VALIDATE_RESULT: ${{ needs.validate.result }}
+          MERGE_RESULT: ${{ needs.merge.result }}
+        run: |
+          gh label create upstream-sync \
+            --color "0E8A16" \
+            --description "Automated upstream synchronization" || true
+
+          body_file="$(mktemp)"
+          {
+            echo "The automated upstream sync did not complete."
+            echo
+            echo "- Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+            echo "- Trigger: ${GITHUB_EVENT_NAME}"
+            echo "- Upstream: ${UPSTREAM_REPOSITORY}:${BASE_BRANCH}"
+            echo "- Sync job: ${SYNC_RESULT}"
+            echo "- Validation job: ${VALIDATE_RESULT}"
+            echo "- Merge job: ${MERGE_RESULT}"
+            echo
+            echo "Review the run logs, resolve merge conflicts or failing tests, then rerun the Sync upstream dev workflow."
+          } > "$body_file"
+
+          issue_number="$(gh issue list --state open --search "${TITLE} in:title" --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -n 1)"
+          if [ -n "$issue_number" ]; then
+            gh issue edit "$issue_number" --body-file "$body_file" --add-label upstream-sync
+          else
+            gh issue create --title "$TITLE" --body-file "$body_file" --label upstream-sync
+          fi
