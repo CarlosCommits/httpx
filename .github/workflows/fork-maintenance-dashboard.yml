@@ -1,0 +1,103 @@
+name: Fork maintenance dashboard
+
+on:
+  schedule:
+    - cron: "45 10 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+  issues: write
+
+env:
+  UPSTREAM_REPOSITORY: projectdiscovery/httpx
+  BASE_BRANCH: dev
+  DASHBOARD_TITLE: httpx fork maintenance dashboard
+
+jobs:
+  dashboard:
+    name: Update maintenance issue
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.BASE_BRANCH }}
+          fetch-depth: 0
+
+      - name: Update dashboard issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git remote add upstream "https://github.com/${UPSTREAM_REPOSITORY}.git"
+          git fetch origin "${BASE_BRANCH}"
+          git fetch upstream "${BASE_BRANCH}"
+
+          fork_sha="$(git rev-parse --short "origin/${BASE_BRANCH}")"
+          upstream_sha="$(git rev-parse --short "upstream/${BASE_BRANCH}")"
+          ahead_count="$(git rev-list --count "upstream/${BASE_BRANCH}..origin/${BASE_BRANCH}")"
+          behind_count="$(git rev-list --count "origin/${BASE_BRANCH}..upstream/${BASE_BRANCH}")"
+
+          if git merge-base --is-ancestor "upstream/${BASE_BRANCH}" "origin/${BASE_BRANCH}"; then
+            upstream_status="contained"
+          else
+            upstream_status="behind upstream"
+          fi
+
+          latest_sync="$(gh run list \
+            --workflow "Sync upstream dev" \
+            --limit 1 \
+            --json status,conclusion,event,createdAt,htmlUrl \
+            --jq 'if length == 0 then "No sync runs found" else .[0] | "\(.status) / \(.conclusion // "n/a") via \(.event) at \(.createdAt) - \(.htmlUrl)" end')"
+
+          open_sync_prs="$(gh pr list \
+            --base "${BASE_BRANCH}" \
+            --head automation/sync-upstream-dev \
+            --state open \
+            --json number,title,url,mergeStateStatus \
+            --jq 'if length == 0 then "None" else map("#\(.number) \(.title) [\(.mergeStateStatus)] - \(.url)") | join("\n") end')"
+
+          blocked_issue="$(gh issue list \
+            --state open \
+            --search "Upstream httpx sync blocked in:title" \
+            --json number,title,url \
+            --jq 'if length == 0 then "None" else map("#\(.number) \(.title) - \(.url)") | join("\n") end')"
+
+          gh label create maintenance \
+            --color "5319E7" \
+            --description "Maintenance tracking" || true
+
+          body_file="$(mktemp)"
+          {
+            echo "Automated fork-maintenance snapshot."
+            echo
+            echo "| Check | Value |"
+            echo "| --- | --- |"
+            echo "| Fork branch | ${BASE_BRANCH} @ ${fork_sha} |"
+            echo "| Upstream branch | ${UPSTREAM_REPOSITORY}:${BASE_BRANCH} @ ${upstream_sha} |"
+            echo "| Upstream status | ${upstream_status} |"
+            echo "| Fork-only commits ahead | ${ahead_count} |"
+            echo "| Upstream commits behind | ${behind_count} |"
+            echo "| Latest sync run | ${latest_sync} |"
+            echo
+            echo "Open upstream sync PRs:"
+            echo '```'
+            printf '%s\n' "$open_sync_prs"
+            echo '```'
+            echo
+            echo "Open blocked-sync issue:"
+            echo '```'
+            printf '%s\n' "$blocked_issue"
+            echo '```'
+            echo
+            echo "Updated by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          } > "$body_file"
+
+          issue_number="$(gh issue list --state open --search "${DASHBOARD_TITLE} in:title" --json number,title --jq ".[] | select(.title == \"${DASHBOARD_TITLE}\") | .number" | head -n 1)"
+          if [ -n "$issue_number" ]; then
+            gh issue edit "$issue_number" --body-file "$body_file" --add-label maintenance
+          else
+            gh issue create --title "$DASHBOARD_TITLE" --body-file "$body_file" --label maintenance
+          fi
