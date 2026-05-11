@@ -149,12 +149,7 @@ func New(options *Options) (*Runner, error) {
 	if options.Wappalyzer != nil {
 		runner.wappalyzer = options.Wappalyzer
 	} else if options.TechDetect || options.HeadlessTechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload {
-		runner.wappalyzer, err = func() (*wappalyzer.Wappalyze, error) {
-			if options.CustomFingerprintFile != "" {
-				return wappalyzer.NewFromFile(options.CustomFingerprintFile, true, true)
-			}
-			return wappalyzer.New()
-		}()
+		runner.wappalyzer, err = newWappalyzerClient(options.CustomFingerprintFile)
 	}
 	if err != nil {
 		return nil, errors.Wrap(err, "could not create wappalyzer client")
