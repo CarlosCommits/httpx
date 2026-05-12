@@ -47,6 +47,7 @@ jobs:
           fi
 
           latest_sync="$(gh run list \
+            --repo "${GITHUB_REPOSITORY}" \
             --limit 20 \
             --json workflowName,status,conclusion,event,createdAt,url \
             --jq '[.[] | select(.workflowName == "Sync upstream dev")][0] // empty | "\(.status) / \(.conclusion // "n/a") via \(.event) at \(.createdAt) - \(.url)"')"
@@ -55,6 +56,7 @@ jobs:
           fi
 
           open_sync_prs="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
             --base "${BASE_BRANCH}" \
             --head automation/sync-upstream-dev \
             --state open \
@@ -62,6 +64,7 @@ jobs:
             --jq 'if length == 0 then "None" else map("#\(.number) \(.title) [\(.mergeStateStatus)] - \(.url)") | join("\n") end')"
 
           blocked_issue="$(gh issue list \
+            --repo "${GITHUB_REPOSITORY}" \
             --state open \
             --search "Upstream httpx sync blocked in:title" \
             --json number,title,url \
@@ -93,7 +96,7 @@ jobs:
             echo "Updated by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
           } > "$body_file"
 
-          if [ "$(gh repo view --json hasIssuesEnabled --jq '.hasIssuesEnabled')" != "true" ]; then
+          if [ "$(gh repo view "${GITHUB_REPOSITORY}" --json hasIssuesEnabled --jq '.hasIssuesEnabled')" != "true" ]; then
             {
               echo "Issues are disabled for ${GITHUB_REPOSITORY}; writing dashboard to the workflow summary instead."
               echo
@@ -103,12 +106,13 @@ jobs:
           fi
 
           gh label create maintenance \
+            --repo "${GITHUB_REPOSITORY}" \
             --color "5319E7" \
             --description "Maintenance tracking" || true
 
-          issue_number="$(gh issue list --state open --search "${DASHBOARD_TITLE} in:title" --json number,title --jq ".[] | select(.title == \"${DASHBOARD_TITLE}\") | .number" | head -n 1)"
+          issue_number="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --search "${DASHBOARD_TITLE} in:title" --json number,title --jq ".[] | select(.title == \"${DASHBOARD_TITLE}\") | .number" | head -n 1)"
           if [ -n "$issue_number" ]; then
-            gh issue edit "$issue_number" --body-file "$body_file" --add-label maintenance
+            gh issue edit "$issue_number" --repo "${GITHUB_REPOSITORY}" --body-file "$body_file" --add-label maintenance
           else
-            gh issue create --title "$DASHBOARD_TITLE" --body-file "$body_file" --label maintenance
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "$DASHBOARD_TITLE" --body-file "$body_file" --label maintenance
           fi
