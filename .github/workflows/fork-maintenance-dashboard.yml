@@ -49,8 +49,8 @@ jobs:
           latest_sync="$(gh run list \
             --workflow "Sync upstream dev" \
             --limit 1 \
-            --json status,conclusion,event,createdAt,htmlUrl \
-            --jq 'if length == 0 then "No sync runs found" else .[0] | "\(.status) / \(.conclusion // "n/a") via \(.event) at \(.createdAt) - \(.htmlUrl)" end')"
+            --json status,conclusion,event,createdAt,url \
+            --jq 'if length == 0 then "No sync runs found" else .[0] | "\(.status) / \(.conclusion // "n/a") via \(.event) at \(.createdAt) - \(.url)" end')"
 
           open_sync_prs="$(gh pr list \
             --base "${BASE_BRANCH}" \
@@ -64,10 +64,6 @@ jobs:
             --search "Upstream httpx sync blocked in:title" \
             --json number,title,url \
             --jq 'if length == 0 then "None" else map("#\(.number) \(.title) - \(.url)") | join("\n") end')"
-
-          gh label create maintenance \
-            --color "5319E7" \
-            --description "Maintenance tracking" || true
 
           body_file="$(mktemp)"
           {
@@ -94,6 +90,19 @@ jobs:
             echo
             echo "Updated by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
           } > "$body_file"
+
+          if [ "$(gh repo view --json hasIssuesEnabled --jq '.hasIssuesEnabled')" != "true" ]; then
+            {
+              echo "Issues are disabled for ${GITHUB_REPOSITORY}; writing dashboard to the workflow summary instead."
+              echo
+              cat "$body_file"
+            } >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          gh label create maintenance \
+            --color "5319E7" \
+            --description "Maintenance tracking" || true
 
           issue_number="$(gh issue list --state open --search "${DASHBOARD_TITLE} in:title" --json number,title --jq ".[] | select(.title == \"${DASHBOARD_TITLE}\") | .number" | head -n 1)"
           if [ -n "$issue_number" ]; then
