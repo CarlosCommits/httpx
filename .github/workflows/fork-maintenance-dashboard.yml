@@ -47,10 +47,12 @@ jobs:
           fi
 
           latest_sync="$(gh run list \
-            --workflow "Sync upstream dev" \
-            --limit 1 \
-            --json status,conclusion,event,createdAt,url \
-            --jq 'if length == 0 then "No sync runs found" else .[0] | "\(.status) / \(.conclusion // "n/a") via \(.event) at \(.createdAt) - \(.url)" end')"
+            --limit 20 \
+            --json workflowName,status,conclusion,event,createdAt,url \
+            --jq '[.[] | select(.workflowName == "Sync upstream dev")][0] // empty | "\(.status) / \(.conclusion // "n/a") via \(.event) at \(.createdAt) - \(.url)"')"
+          if [ -z "$latest_sync" ]; then
+            latest_sync="No sync runs found"
+          fi
 
           open_sync_prs="$(gh pr list \
             --base "${BASE_BRANCH}" \
