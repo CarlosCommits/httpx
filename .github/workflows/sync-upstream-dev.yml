@@ -86,9 +86,11 @@ jobs:
           CHANGED_FILES: ${{ steps.sync.outputs.changed_files }}
         run: |
           gh label create upstream-sync \
+            --repo "${GITHUB_REPOSITORY}" \
             --color "0E8A16" \
             --description "Automated upstream synchronization" || true
           gh label create needs-review \
+            --repo "${GITHUB_REPOSITORY}" \
             --color "D93F0B" \
             --description "Requires human review before merge" || true
 
@@ -106,24 +108,31 @@ jobs:
             echo '```'
           } > "$body_file"
 
-          pr_number="$(gh pr list --base "${BASE_BRANCH}" --head "${SYNC_BRANCH}" --json number --jq '.[0].number')"
+          pr_number="$(gh pr list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --base "${BASE_BRANCH}" \
+            --head "${SYNC_BRANCH}" \
+            --json number \
+            --jq '.[0].number')"
 
           if [ -z "$pr_number" ]; then
             pr_url="$(gh pr create \
+              --repo "${GITHUB_REPOSITORY}" \
               --base "${BASE_BRANCH}" \
               --head "${SYNC_BRANCH}" \
               --title "chore: sync upstream dev" \
               --body-file "$body_file")"
-            pr_number="$(gh pr view "$pr_url" --json number --jq '.number')"
+            pr_number="$(gh pr view "$pr_url" --repo "${GITHUB_REPOSITORY}" --json number --jq '.number')"
           else
             gh pr edit "$pr_number" \
+              --repo "${GITHUB_REPOSITORY}" \
               --title "chore: sync upstream dev" \
               --body-file "$body_file"
           fi
 
-          gh pr edit "$pr_number" --add-label upstream-sync
+          gh pr edit "$pr_number" --repo "${GITHUB_REPOSITORY}" --add-label upstream-sync
           if [ "${RISKY_SYNC}" = "true" ]; then
-            gh pr edit "$pr_number" --add-label needs-review
+            gh pr edit "$pr_number" --repo "${GITHUB_REPOSITORY}" --add-label needs-review
           fi
 
           echo "pr_number=$pr_number" >> "$GITHUB_OUTPUT"
@@ -192,6 +201,7 @@ jobs:
           MERGE_RESULT: ${{ needs.merge.result }}
         run: |
           gh label create upstream-sync \
+            --repo "${GITHUB_REPOSITORY}" \
             --color "0E8A16" \
             --description "Automated upstream synchronization" || true
 
@@ -209,9 +219,14 @@ jobs:
             echo "Review the run logs, resolve merge conflicts or failing tests, then rerun the Sync upstream dev workflow."
           } > "$body_file"
 
-          issue_number="$(gh issue list --state open --search "${TITLE} in:title" --json number,title --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -n 1)"
+          issue_number="$(gh issue list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --state open \
+            --search "${TITLE} in:title" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -n 1)"
           if [ -n "$issue_number" ]; then
-            gh issue edit "$issue_number" --body-file "$body_file" --add-label upstream-sync
+            gh issue edit "$issue_number" --repo "${GITHUB_REPOSITORY}" --body-file "$body_file" --add-label upstream-sync
           else
-            gh issue create --title "$TITLE" --body-file "$body_file" --label upstream-sync
+            gh issue create --repo "${GITHUB_REPOSITORY}" --title "$TITLE" --body-file "$body_file" --label upstream-sync
           fi
