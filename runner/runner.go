@@ -739,11 +739,10 @@ func (r *Runner) streamInput() (chan string, error) {
 					return
 				}
 			} else {
-				fchan, err := fileutil.ReadFile(r.options.InputFile)
-				if err != nil {
-					return
-				}
-				for item := range fchan {
+				for item, err := range fileutil.Lines(r.options.InputFile) {
+					if err != nil {
+						return
+					}
 					if r.options.SkipDedupe || r.testAndSet(item) {
 						if !trySend(item) {
 							return
@@ -757,11 +756,10 @@ func (r *Runner) streamInput() (chan string, error) {
 				gologger.Fatal().Msgf("No input provided: %s", err)
 			}
 			for _, file := range files {
-				fchan, err := fileutil.ReadFile(file)
-				if err != nil {
-					return
-				}
-				for item := range fchan {
+				for item, err := range fileutil.Lines(file) {
+					if err != nil {
+						return
+					}
 					if r.options.SkipDedupe || r.testAndSet(item) {
 						if !trySend(item) {
 							return
@@ -771,11 +769,10 @@ func (r *Runner) streamInput() (chan string, error) {
 			}
 		}
 		if fileutil.HasStdin() {
-			fchan, err := fileutil.ReadFileWithReader(os.Stdin)
-			if err != nil {
-				return
-			}
-			for item := range fchan {
+			for item, err := range fileutil.LinesReader(os.Stdin) {
+				if err != nil {
+					return
+				}
 				if r.options.SkipDedupe || r.testAndSet(item) {
 					if !trySend(item) {
 						return
