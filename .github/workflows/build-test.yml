@@ -2,15 +2,13 @@ name: 🔨 Build Test
 
 on:
   pull_request:
-    paths:
-      - '**.go'
-      - '**.mod'
+    branches:
+      - dev
   workflow_dispatch:
 
 jobs:
   lint:
     name: Lint Test
-    if: ${{ !endsWith(github.actor, '[bot]') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
