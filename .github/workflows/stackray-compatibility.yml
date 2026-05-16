@@ -1,0 +1,34 @@
+name: Stackray compatibility
+
+on:
+  pull_request:
+    branches:
+      - dev
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stackray-compatibility:
+    name: Stackray compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Build httpx CLI
+        run: go build .
+        working-directory: cmd/httpx
+
+      - name: Stackray runner contract
+        run: go test ./runner -run TestStackrayContract -count=1
+
+      - name: Stackray CLI JSONL contract
+        run: go test ./cmd/httpx -run TestStackrayCLIContract -count=1
