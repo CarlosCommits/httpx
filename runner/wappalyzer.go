@@ -48,10 +48,14 @@ func newWappalyzerClient(customFingerprintFile string) (*wappalyzer.Wappalyze, e
 		return nil, err
 	}
 	mergedPath := mergedFile.Name()
-	defer os.Remove(mergedPath)
+	defer func() {
+		_ = os.Remove(mergedPath)
+	}()
 
 	if _, err := mergedFile.Write(mergedContents); err != nil {
-		mergedFile.Close()
+		if closeErr := mergedFile.Close(); closeErr != nil {
+			return nil, errors.Wrapf(err, "failed to write merged fingerprints and close temp file: %v", closeErr)
+		}
 		return nil, err
 	}
 	if err := mergedFile.Close(); err != nil {
