@@ -2347,10 +2347,13 @@ retry:
 
 	var faviconMMH3, faviconMD5, faviconPath, faviconURL string
 	var faviconData []byte
+	var faviconPrinted bool
 	if scanopts.Favicon {
 		var err error
 		faviconMMH3, faviconMD5, faviconPath, faviconData, faviconURL, err = r.HandleFaviconHash(hp, req, resp.Data, finalURL, true)
-		if err == nil {
+		if err != nil {
+			gologger.Warning().Msgf("could not calculate favicon hash for path %v : %s", faviconPath, err)
+		} else if faviconMMH3 != "" {
 			builder.WriteString(" [")
 			if !scanopts.OutputWithNoColor {
 				builder.WriteString(aurora.Magenta(faviconMMH3).String())
@@ -2358,8 +2361,7 @@ retry:
 				builder.WriteString(faviconMMH3)
 			}
 			builder.WriteRune(']')
-		} else {
-			gologger.Warning().Msgf("could not calculate favicon hash for path %v : %s", faviconPath, err)
+			faviconPrinted = true
 		}
 	}
 
@@ -2550,6 +2552,7 @@ retry:
 			FullPage:                scanopts.IsScreenshotFullPage(),
 			JSCodes:                 r.options.JavascriptCodes,
 			CaptureScreenshot:       scanopts.Screenshot,
+			CaptureFavicon:          scanopts.Favicon,
 			DetectRuntimeTechnology: scanopts.HeadlessTechDetect,
 			WappalyzerClient:        r.wappalyzer,
 		})
@@ -2561,6 +2564,18 @@ retry:
 			headlessTitle = headlessResult.Title
 			linkRequest = headlessResult.NetworkRequests
 			runtimeMatches = headlessResult.RuntimeMatches
+			if scanopts.Favicon && faviconMMH3 == "" {
+				faviconMMH3, faviconMD5, faviconPath, faviconData, faviconURL = r.HandleHeadlessFaviconHash(headlessResult.Favicons)
+				if faviconMMH3 != "" && !faviconPrinted {
+					builder.WriteString(" [")
+					if !scanopts.OutputWithNoColor {
+						builder.WriteString(aurora.Magenta(faviconMMH3).String())
+					} else {
+						builder.WriteString(faviconMMH3)
+					}
+					builder.WriteRune(']')
+				}
+			}
 
 			if scanopts.Screenshot {
 				pHash, err = calculatePerceptionHash(screenshotBytes)
@@ -2881,6 +2896,23 @@ func (r *Runner) HandleFaviconHash(hp *httpx.HTTPX, req *retryablehttp.Request, 
 	}
 
 	return faviconMMH3, faviconMD5, faviconPath, faviconData, faviconURL, nil
+}
+
+func (r *Runner) HandleHeadlessFaviconHash(favicons []HeadlessFavicon) (string, string, string, []byte, string) {
+	for _, favicon := range favicons {
+		if len(favicon.Data) == 0 {
+			continue
+		}
+
+		mmh3, md5h, err := r.calculateFaviconHashWithRaw(favicon.Data)
+		if err != nil {
+			continue
+		}
+
+		return mmh3, md5h, favicon.Path, favicon.Data, favicon.URL
+	}
+
+	return "", "", "", nil, ""
 }
 
 func (r *Runner) calculateFaviconHashWithRaw(data []byte) (string, string, error) {

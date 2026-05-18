@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"os"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -167,16 +168,35 @@ type HeadlessVisitOptions struct {
 	FullPage                bool
 	JSCodes                 []string
 	CaptureScreenshot       bool
+	CaptureFavicon          bool
 	DetectRuntimeTechnology bool
 	WappalyzerClient        *wappalyzer.Wappalyze
+}
+
+type HeadlessFavicon struct {
+	Path string
+	URL  string
+	Data []byte
 }
 
 type HeadlessVisitResult struct {
 	ScreenshotBytes []byte
 	Body            string
 	Title           string
+	Favicons        []HeadlessFavicon
 	NetworkRequests []NetworkRequest
 	RuntimeMatches  map[string]wappalyzer.AppInfo
+}
+
+type headlessFaviconCandidate struct {
+	Path string `json:"path"`
+	URL  string `json:"url"`
+}
+
+type headlessFaviconPayload struct {
+	Path       string `json:"path"`
+	URL        string `json:"url"`
+	DataBase64 string `json:"dataBase64"`
 }
 
 // MustDisableSandbox determines if the current os and user needs sandbox mode disabled
@@ -289,6 +309,9 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 		Title:           title,
 		NetworkRequests: networkRequests,
 		RuntimeMatches:  map[string]wappalyzer.AppInfo{},
+	}
+	if options.CaptureFavicon {
+		result.Favicons = b.collectHeadlessFavicons(page, body, networkRequests)
 	}
 	if options.DetectRuntimeTechnology {
 		result.RuntimeMatches = b.detectRuntimeTechnologies(page, networkRequests, body, options.WappalyzerClient)
@@ -415,6 +438,284 @@ func (b *Browser) captureDocumentTitle(page *rod.Page) string {
 	}
 
 	return strings.TrimSpace(rawValue)
+}
+
+func (b *Browser) collectHeadlessFavicons(page *rod.Page, pageBody string, networkRequests []NetworkRequest) []HeadlessFavicon {
+	const maxFavicons = 5
+
+	candidates := b.collectDocumentFaviconCandidates(page)
+	if len(candidates) == 0 {
+		candidates = b.collectHTMLFaviconCandidates(page, pageBody)
+	}
+	candidates = prioritizeHeadlessFaviconCandidates(candidates)
+
+	favicons := make([]HeadlessFavicon, 0, len(candidates))
+	for _, candidate := range candidates {
+		if len(favicons) >= maxFavicons {
+			break
+		}
+		if favicon, ok := b.collectHeadlessFaviconFromNetwork(page, candidate, networkRequests); ok {
+			favicons = append(favicons, favicon)
+			continue
+		}
+		if favicon, ok := b.fetchHeadlessFavicon(page, candidate); ok {
+			favicons = append(favicons, favicon)
+		}
+	}
+
+	return favicons
+}
+
+func (b *Browser) collectDocumentFaviconCandidates(page *rod.Page) []headlessFaviconCandidate {
+	output, err := page.Eval(`() => {
+const candidates = [];
+const seen = new Set();
+const addCandidate = (href) => {
+  if (!href) return;
+  try {
+    const absoluteURL = new URL(href, document.baseURI || window.location.href).href;
+    if (seen.has(absoluteURL)) return;
+    seen.add(absoluteURL);
+    candidates.push({ path: href, url: absoluteURL });
+  } catch {}
+};
+for (const link of Array.from(document.querySelectorAll("link[rel][href]"))) {
+  const rel = (link.getAttribute("rel") || "").toLowerCase();
+  if (!rel.split(/\s+/).some((token) => token.includes("icon"))) continue;
+  addCandidate(link.getAttribute("href"));
+}
+if (candidates.length === 0) {
+  addCandidate("/favicon.ico");
+}
+return candidates.slice(0, 10);
+}`)
+	if err != nil {
+		return nil
+	}
+
+	return decodeHeadlessFaviconCandidates(output)
+}
+
+func (b *Browser) collectHTMLFaviconCandidates(page *rod.Page, pageBody string) []headlessFaviconCandidate {
+	currentURL := b.collectRuntimePageURL(page)
+	if currentURL == "" || pageBody == "" {
+		return nil
+	}
+
+	hrefs, baseHref, err := extractPotentialFavIconsURLs([]byte(pageBody))
+	if err != nil {
+		return nil
+	}
+	if len(hrefs) == 0 {
+		hrefs = append(hrefs, "/favicon.ico")
+	}
+
+	baseURL, err := url.Parse(currentURL)
+	if err != nil {
+		return nil
+	}
+	if baseHref != "" {
+		if parsedBaseHref, err := url.Parse(baseHref); err == nil {
+			baseURL = baseURL.ResolveReference(parsedBaseHref)
+		}
+	}
+
+	candidates := make([]headlessFaviconCandidate, 0, len(hrefs))
+	seen := map[string]struct{}{}
+	for _, href := range hrefs {
+		href = strings.TrimSpace(href)
+		if href == "" {
+			continue
+		}
+		parsedHref, err := url.Parse(href)
+		if err != nil {
+			continue
+		}
+		resolvedURL := baseURL.ResolveReference(parsedHref).String()
+		if _, ok := seen[resolvedURL]; ok {
+			continue
+		}
+		seen[resolvedURL] = struct{}{}
+		candidates = append(candidates, headlessFaviconCandidate{
+			Path: href,
+			URL:  resolvedURL,
+		})
+	}
+
+	return candidates
+}
+
+func decodeHeadlessFaviconCandidates(output *proto.RuntimeRemoteObject) []headlessFaviconCandidate {
+	if output == nil {
+		return nil
+	}
+
+	rawValue := fmt.Sprint(output.Value)
+	var candidates []headlessFaviconCandidate
+	if err := json.Unmarshal([]byte(rawValue), &candidates); err != nil {
+		return nil
+	}
+
+	return candidates
+}
+
+func prioritizeHeadlessFaviconCandidates(candidates []headlessFaviconCandidate) []headlessFaviconCandidate {
+	seen := map[string]struct{}{}
+	deduped := make([]headlessFaviconCandidate, 0, len(candidates))
+	for _, candidate := range candidates {
+		candidate.Path = strings.TrimSpace(candidate.Path)
+		candidate.URL = strings.TrimSpace(candidate.URL)
+		if candidate.URL == "" {
+			continue
+		}
+		key := strings.ToLower(candidate.URL)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		deduped = append(deduped, candidate)
+	}
+
+	sort.SliceStable(deduped, func(i, j int) bool {
+		ai := strings.HasSuffix(strings.ToLower(deduped[i].Path), ".ico") || strings.HasSuffix(strings.ToLower(deduped[i].URL), ".ico")
+		aj := strings.HasSuffix(strings.ToLower(deduped[j].Path), ".ico") || strings.HasSuffix(strings.ToLower(deduped[j].URL), ".ico")
+		if ai == aj {
+			return deduped[i].URL < deduped[j].URL
+		}
+		return ai && !aj
+	})
+
+	return deduped
+}
+
+func (b *Browser) collectHeadlessFaviconFromNetwork(page *rod.Page, candidate headlessFaviconCandidate, networkRequests []NetworkRequest) (HeadlessFavicon, bool) {
+	const maxFaviconBytes = 1024 * 1024
+
+	for _, request := range networkRequests {
+		if request.RequestID == "" || request.StatusCode != http.StatusOK || !sameURLWithoutFragment(request.URL, candidate.URL) {
+			continue
+		}
+
+		responseBody, err := proto.NetworkGetResponseBody{
+			RequestID: proto.NetworkRequestID(request.RequestID),
+		}.Call(page)
+		if err != nil {
+			continue
+		}
+
+		data := []byte(responseBody.Body)
+		if responseBody.Base64Encoded {
+			decoded, err := base64.StdEncoding.DecodeString(responseBody.Body)
+			if err != nil {
+				continue
+			}
+			data = decoded
+		}
+		if len(data) == 0 || len(data) > maxFaviconBytes {
+			continue
+		}
+
+		return HeadlessFavicon{
+			Path: candidate.Path,
+			URL:  request.URL,
+			Data: data,
+		}, true
+	}
+
+	return HeadlessFavicon{}, false
+}
+
+func (b *Browser) fetchHeadlessFavicon(page *rod.Page, candidate headlessFaviconCandidate) (HeadlessFavicon, bool) {
+	const maxFaviconBytes = 1024 * 1024
+
+	output, err := page.Timeout(10*time.Second).Eval(`async (candidate) => {
+const maxBytes = candidate.maxBytes;
+const controller = new AbortController();
+const timer = setTimeout(() => controller.abort(), 8000);
+try {
+  const response = await fetch(candidate.url, {
+    credentials: "include",
+    cache: "force-cache",
+    signal: controller.signal
+  });
+  if (!response.ok) return null;
+  const contentLength = Number(response.headers.get("content-length") || "0");
+  if (contentLength > maxBytes) return null;
+  const buffer = await response.arrayBuffer();
+  if (buffer.byteLength === 0 || buffer.byteLength > maxBytes) return null;
+  const bytes = new Uint8Array(buffer);
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + chunkSize));
+  }
+  return {
+    path: candidate.path,
+    url: response.url || candidate.url,
+    dataBase64: btoa(binary)
+  };
+} catch {
+  return null;
+} finally {
+  clearTimeout(timer);
+}
+}`, map[string]interface{}{
+		"path":     candidate.Path,
+		"url":      candidate.URL,
+		"maxBytes": maxFaviconBytes,
+	})
+	if err != nil || output == nil {
+		return HeadlessFavicon{}, false
+	}
+
+	rawValue := fmt.Sprint(output.Value)
+	if rawValue == "" || rawValue == "null" {
+		return HeadlessFavicon{}, false
+	}
+
+	var payload headlessFaviconPayload
+	if err := json.Unmarshal([]byte(rawValue), &payload); err != nil || payload.DataBase64 == "" {
+		return HeadlessFavicon{}, false
+	}
+	data, err := base64.StdEncoding.DecodeString(payload.DataBase64)
+	if err != nil || len(data) == 0 || len(data) > maxFaviconBytes {
+		return HeadlessFavicon{}, false
+	}
+
+	return HeadlessFavicon{
+		Path: payload.Path,
+		URL:  payload.URL,
+		Data: data,
+	}, true
+}
+
+func sameURLWithoutFragment(left string, right string) bool {
+	leftURL, err := url.Parse(left)
+	if err != nil {
+		return false
+	}
+	rightURL, err := url.Parse(right)
+	if err != nil {
+		return false
+	}
+	leftURL.Fragment = ""
+	rightURL.Fragment = ""
+	return strings.EqualFold(leftURL.String(), rightURL.String())
+}
+
+func (b *Browser) collectRuntimePageURL(page *rod.Page) string {
+	output, err := page.Eval(`() => window.location.href`)
+	if err != nil {
+		return ""
+	}
+
+	rawValue := fmt.Sprint(output.Value)
+	var pageURL string
+	if err := json.Unmarshal([]byte(rawValue), &pageURL); err != nil {
+		pageURL = rawValue
+	}
+
+	return strings.TrimSpace(pageURL)
 }
 
 func (b *Browser) waitForHeadlessReadiness(page *rod.Page, networkTracker *headlessNetworkTracker) {
