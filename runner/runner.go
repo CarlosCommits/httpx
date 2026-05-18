@@ -2791,9 +2791,10 @@ func (r *Runner) HandleFaviconHash(hp *httpx.HTTPX, req *retryablehttp.Request, 
 		return "", "", "", nil, "", err
 	}
 
-	// If none found and probing allowed, add default /favicon.ico
-	if len(hrefs) == 0 && defaultProbe {
-		hrefs = append(hrefs, "/favicon.ico")
+	// Keep the conventional root favicon probe as a fallback even when the
+	// document advertises icon candidates that later fail.
+	if defaultProbe {
+		hrefs = appendDefaultFaviconCandidate(hrefs)
 	}
 
 	// Determine base URL: prefer finalURL (redirect target) then apply <base href>
@@ -2943,7 +2944,7 @@ func extractPotentialFavIconsURLs(resp []byte) (candidates []string, baseHref st
 		}
 		for _, tok := range strings.Fields(rel) {
 			switch tok {
-			case "icon", "shortcut", "shortcut-icon", "apple-touch-icon", "mask-icon", "alternate":
+			case "icon", "shortcut", "shortcut-icon", "apple-touch-icon", "mask-icon":
 				candidates = append(candidates, href)
 				return
 			}
@@ -2960,6 +2961,16 @@ func extractPotentialFavIconsURLs(resp []byte) (candidates []string, baseHref st
 	})
 
 	return candidates, baseHref, nil
+}
+
+func appendDefaultFaviconCandidate(candidates []string) []string {
+	for _, candidate := range candidates {
+		if strings.TrimSpace(candidate) == "/favicon.ico" {
+			return candidates
+		}
+	}
+
+	return append(candidates, "/favicon.ico")
 }
 
 // SaveResumeConfig to file
