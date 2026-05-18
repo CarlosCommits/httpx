@@ -154,6 +154,29 @@ func TestStackrayContractHeadlessFaviconHash(t *testing.T) {
 	}
 }
 
+func TestStackrayContractFaviconCandidatesIgnorePlainAlternateLinks(t *testing.T) {
+	html := []byte(`<!doctype html>
+<html>
+  <head>
+    <link rel="alternate" href="https://example.com/fr/" hreflang="fr" />
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+</html>`)
+
+	candidates, _, err := extractPotentialFavIconsURLs(html)
+	if err != nil {
+		t.Fatalf("expected favicon candidates to parse: %v", err)
+	}
+	if len(candidates) != 0 {
+		t.Fatalf("expected plain alternate links to be ignored as favicon candidates, got %#v", candidates)
+	}
+
+	candidates = appendDefaultFaviconCandidate(candidates)
+	if len(candidates) != 1 || candidates[0] != "/favicon.ico" {
+		t.Fatalf("expected default favicon fallback candidate, got %#v", candidates)
+	}
+}
+
 func jsonArrayContainsString(values []any, expected string) bool {
 	for _, value := range values {
 		if value == expected {
