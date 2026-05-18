@@ -174,6 +174,7 @@ type HeadlessVisitOptions struct {
 type HeadlessVisitResult struct {
 	ScreenshotBytes []byte
 	Body            string
+	Title           string
 	NetworkRequests []NetworkRequest
 	RuntimeMatches  map[string]wappalyzer.AppInfo
 }
@@ -277,7 +278,7 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 	}
 	defer b.closePage(page)
 
-	screenshot, body, networkRequests, err := b.capturePageArtifacts(page, networkTracker, options.Idle, options.FullPage, options.CaptureScreenshot, options.DetectRuntimeTechnology)
+	screenshot, body, title, networkRequests, err := b.capturePageArtifacts(page, networkTracker, options.Idle, options.FullPage, options.CaptureScreenshot, options.DetectRuntimeTechnology)
 	if err != nil {
 		return nil, err
 	}
@@ -285,6 +286,7 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 	result := &HeadlessVisitResult{
 		ScreenshotBytes: screenshot,
 		Body:            body,
+		Title:           title,
 		NetworkRequests: networkRequests,
 		RuntimeMatches:  map[string]wappalyzer.AppInfo{},
 	}
@@ -370,10 +372,10 @@ func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, header
 	return page, networkTracker, nil
 }
 
-// capturePageArtifacts waits for the page and returns rendered HTML with optional screenshot bytes.
-func (b *Browser) capturePageArtifacts(page *rod.Page, networkTracker *headlessNetworkTracker, idle time.Duration, fullPage bool, captureScreenshot bool, waitForRuntimeReadiness bool) ([]byte, string, []NetworkRequest, error) {
+// capturePageArtifacts waits for the page and returns rendered HTML, document title, and optional screenshot bytes.
+func (b *Browser) capturePageArtifacts(page *rod.Page, networkTracker *headlessNetworkTracker, idle time.Duration, fullPage bool, captureScreenshot bool, waitForRuntimeReadiness bool) ([]byte, string, string, []NetworkRequest, error) {
 	if err := page.WaitLoad(); err != nil {
-		return nil, "", nil, err
+		return nil, "", "", nil, err
 	}
 	_ = page.WaitIdle(idle)
 
@@ -386,16 +388,33 @@ func (b *Browser) capturePageArtifacts(page *rod.Page, networkTracker *headlessN
 		var err error
 		screenshot, err = page.Screenshot(fullPage, &proto.PageCaptureScreenshot{})
 		if err != nil {
-			return nil, "", nil, err
+			return nil, "", "", nil, err
 		}
 	}
 
+	title := b.captureDocumentTitle(page)
+
 	body, err := page.HTML()
 	if err != nil {
-		return screenshot, "", networkTracker.snapshot(), err
+		return screenshot, "", title, networkTracker.snapshot(), err
 	}
 
-	return screenshot, body, networkTracker.snapshot(), nil
+	return screenshot, body, title, networkTracker.snapshot(), nil
+}
+
+func (b *Browser) captureDocumentTitle(page *rod.Page) string {
+	output, err := page.Eval(`() => document.title || ""`)
+	if err != nil {
+		return ""
+	}
+
+	rawValue := fmt.Sprint(output.Value)
+	var title string
+	if err := json.Unmarshal([]byte(rawValue), &title); err == nil {
+		return strings.TrimSpace(title)
+	}
+
+	return strings.TrimSpace(rawValue)
 }
 
 func (b *Browser) waitForHeadlessReadiness(page *rod.Page, networkTracker *headlessNetworkTracker) {

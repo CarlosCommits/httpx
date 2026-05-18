@@ -2116,7 +2116,7 @@ retry:
 		title = httpx.ExtractTitle(resp)
 	}
 
-	if scanopts.OutputTitle && title != "" {
+	writeTitle := func(title string) {
 		builder.WriteString(" [")
 		if !scanopts.OutputWithNoColor {
 			builder.WriteString(aurora.Cyan(title).String())
@@ -2124,6 +2124,9 @@ retry:
 			builder.WriteString(title)
 		}
 		builder.WriteRune(']')
+	}
+	if scanopts.OutputTitle && title != "" && !scanopts.HeadlessTechDetect {
+		writeTitle(title)
 	}
 
 	var bodyPreview string
@@ -2534,6 +2537,7 @@ retry:
 	var (
 		screenshotBytes []byte
 		headlessBody    string
+		headlessTitle   string
 		runtimeMatches  map[string]wappalyzer.AppInfo
 	)
 	var pHash uint64
@@ -2554,6 +2558,7 @@ retry:
 		} else {
 			screenshotBytes = headlessResult.ScreenshotBytes
 			headlessBody = headlessResult.Body
+			headlessTitle = headlessResult.Title
 			linkRequest = headlessResult.NetworkRequests
 			runtimeMatches = headlessResult.RuntimeMatches
 
@@ -2584,6 +2589,16 @@ retry:
 		if scanopts.NoHeadlessBody {
 			headlessBody = ""
 		}
+	}
+	if scanopts.HeadlessTechDetect && scanopts.OutputTitle {
+		if headlessTitle != "" {
+			title = headlessTitle
+		}
+		if title != "" {
+			writeTitle(title)
+		}
+	} else {
+		headlessTitle = ""
 	}
 
 	if scanopts.TechDetect && len(technologies) > 0 {
@@ -2662,6 +2677,7 @@ retry:
 		Location:          resp.GetHeaderPart("Location", ";"),
 		ContentType:       resp.GetHeaderPart("Content-Type", ";"),
 		Title:             title,
+		HeadlessTitle:     headlessTitle,
 		str:               builder.String(),
 		VHost:             isvhost,
 		WebServer:         serverHeader,
