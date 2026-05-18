@@ -1,6 +1,8 @@
 package runner
 
 import (
+	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -112,6 +114,43 @@ func TestStackrayContractHeadlessTitleJSONShape(t *testing.T) {
 	}
 	if got := row["headless_title"]; got != "Rendered Browser Title" {
 		t.Fatalf("expected headless_title to contain rendered browser title, got %#v", got)
+	}
+}
+
+func TestStackrayContractHeadlessFaviconHash(t *testing.T) {
+	faviconBytes, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
+	if err != nil {
+		t.Fatalf("expected test favicon fixture to decode: %v", err)
+	}
+
+	runner := &Runner{}
+	mmh3, md5h, faviconPath, faviconData, faviconURL := runner.HandleHeadlessFaviconHash([]HeadlessFavicon{
+		{
+			Path: "/not-an-image.txt",
+			URL:  "https://example.com/not-an-image.txt",
+			Data: []byte("not an image"),
+		},
+		{
+			Path: "/favicon.ico",
+			URL:  "https://example.com/favicon.ico",
+			Data: faviconBytes,
+		},
+	})
+
+	if mmh3 == "" {
+		t.Fatal("expected headless favicon mmh3 hash to be populated")
+	}
+	if md5h == "" {
+		t.Fatal("expected headless favicon md5 hash to be populated")
+	}
+	if faviconPath != "/favicon.ico" {
+		t.Fatalf("expected favicon path to come from first valid headless favicon, got %q", faviconPath)
+	}
+	if faviconURL != "https://example.com/favicon.ico" {
+		t.Fatalf("expected favicon url to come from first valid headless favicon, got %q", faviconURL)
+	}
+	if !bytes.Equal(faviconData, faviconBytes) {
+		t.Fatal("expected favicon data to come from first valid headless favicon")
 	}
 }
 
