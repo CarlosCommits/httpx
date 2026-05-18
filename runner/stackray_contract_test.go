@@ -96,6 +96,25 @@ func TestStackrayContractTechDetectJSONShape(t *testing.T) {
 	}
 }
 
+func TestStackrayContractHeadlessTitleJSONShape(t *testing.T) {
+	result := Result{
+		URL:           "https://example.com",
+		Title:         "Rendered Browser Title",
+		HeadlessTitle: "Rendered Browser Title",
+	}
+
+	var row map[string]any
+	if err := json.Unmarshal([]byte(result.JSON(nil)), &row); err != nil {
+		t.Fatalf("expected Stackray JSONL row to be valid JSON: %v", err)
+	}
+	if got := row["title"]; got != "Rendered Browser Title" {
+		t.Fatalf("expected title to contain rendered browser title, got %#v", got)
+	}
+	if got := row["headless_title"]; got != "Rendered Browser Title" {
+		t.Fatalf("expected headless_title to contain rendered browser title, got %#v", got)
+	}
+}
+
 func jsonArrayContainsString(values []any, expected string) bool {
 	for _, value := range values {
 		if value == expected {
