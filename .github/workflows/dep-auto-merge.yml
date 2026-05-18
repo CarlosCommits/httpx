@@ -22,7 +22,7 @@ jobs:
     runs-on: ubuntu-latest
     if: contains(fromJSON('["CarlosCommits", "dependabot[bot]", "github-actions[bot]", "app/github-actions"]'), github.event.pull_request.user.login)
     env:
-      GH_TOKEN: ${{ secrets.STACKRAY_DISPATCH_TOKEN || github.token }}
+      GH_TOKEN: ${{ github.token }}
     steps:
       - name: Disable native auto-merge for blocked PRs
         if: >-
@@ -39,7 +39,7 @@ jobs:
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: gh pr merge --disable-auto "$PR_URL" || true
 
-      - name: Enable native auto-merge
+      - name: Wait for PR checks
         if: >-
           ${{
             !github.event.pull_request.draft &&
@@ -52,4 +52,120 @@ jobs:
           }}
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
-        run: gh pr merge --auto --merge "$PR_URL"
+        run: |
+          set -euo pipefail
+
+          stable_passes=0
+          for _ in $(seq 1 120); do
+            rollup="$(gh pr view "$PR_URL" --json statusCheckRollup)"
+
+            failed="$(jq -r '
+              def check_name: .name // .context;
+              def status: .status // .state // "";
+              def conclusion: .conclusion // .state // "";
+              .statusCheckRollup[]
+              | select(check_name != "manage-auto-merge")
+              | select(conclusion != "SKIPPED")
+              | select(
+                  (status == "COMPLETED" and (conclusion != "SUCCESS" and conclusion != "NEUTRAL")) or
+                  (status == "FAILURE") or
+                  (status == "ERROR")
+                )
+              | check_name
+            ' <<< "$rollup")"
+
+            if [ -n "$failed" ]; then
+              echo "Failing checks:"
+              echo "$failed"
+              exit 1
+            fi
+
+            pending="$(jq -r '
+              def check_name: .name // .context;
+              def status: .status // .state // "";
+              def conclusion: .conclusion // .state // "";
+              .statusCheckRollup[]
+              | select(check_name != "manage-auto-merge")
+              | select(conclusion != "SKIPPED")
+              | select(status != "COMPLETED" and status != "SUCCESS")
+              | check_name
+            ' <<< "$rollup")"
+
+            total="$(jq -r '
+              def check_name: .name // .context;
+              def conclusion: .conclusion // .state // "";
+              [
+                .statusCheckRollup[]
+                | select(check_name != "manage-auto-merge")
+                | select(conclusion != "SKIPPED")
+              ]
+              | length
+            ' <<< "$rollup")"
+
+            if [ "$total" -gt 0 ] && [ -z "$pending" ]; then
+              stable_passes=$((stable_passes + 1))
+              if [ "$stable_passes" -ge 2 ]; then
+                echo "All PR checks passed."
+                exit 0
+              fi
+            else
+              stable_passes=0
+              echo "Waiting for PR checks:"
+              echo "$pending"
+            fi
+
+            sleep 15
+          done
+
+          echo "Timed out waiting for PR checks."
+          exit 1
+
+      - name: Merge trusted PR
+        if: >-
+          ${{
+            !github.event.pull_request.draft &&
+            github.event.pull_request.user.login != 'github-actions[bot]' &&
+            github.event.pull_request.user.login != 'app/github-actions' &&
+            github.event.pull_request.head.ref != 'automation/sync-upstream-dev' &&
+            !startsWith(github.event.pull_request.head.ref, 'automation/sync-upstream-') &&
+            !contains(github.event.pull_request.labels.*.name, 'upstream-sync') &&
+            !contains(github.event.pull_request.labels.*.name, 'needs-review')
+          }}
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: gh pr merge --merge "$PR_URL"
+
+      - name: Dispatch Stackray scanner pin update
+        if: >-
+          ${{
+            !github.event.pull_request.draft &&
+            github.event.pull_request.user.login != 'github-actions[bot]' &&
+            github.event.pull_request.user.login != 'app/github-actions' &&
+            github.event.pull_request.head.ref != 'automation/sync-upstream-dev' &&
+            !startsWith(github.event.pull_request.head.ref, 'automation/sync-upstream-') &&
+            !contains(github.event.pull_request.labels.*.name, 'upstream-sync') &&
+            !contains(github.event.pull_request.labels.*.name, 'needs-review')
+          }}
+        env:
+          STACKRAY_DISPATCH_TOKEN: ${{ secrets.STACKRAY_DISPATCH_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$STACKRAY_DISPATCH_TOKEN" ]; then
+            echo "::notice title=Stackray dispatch skipped::Set STACKRAY_DISPATCH_TOKEN to trigger Stackray scanner pin updates."
+            exit 0
+          fi
+
+          merge_sha="$(gh pr view "$PR_URL" --json mergeCommit --jq '.mergeCommit.oid')"
+          if [ -z "$merge_sha" ]; then
+            echo "Merged PR did not expose a merge commit SHA."
+            exit 1
+          fi
+
+          curl -fsS \
+            -X POST \
+            -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer ${STACKRAY_DISPATCH_TOKEN}" \
+            https://api.github.com/repos/CarlosCommits/stackray/dispatches \
+            -d "{\"event_type\":\"httpx-dev-updated\",\"client_payload\":{\"httpx_sha\":\"${merge_sha}\",\"httpx_ref\":\"dev\"}}"
