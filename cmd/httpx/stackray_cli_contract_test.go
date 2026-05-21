@@ -52,9 +52,12 @@ func TestStackrayCLIContractTechDetectJSONL(t *testing.T) {
 	)
 	cmd.Dir = "."
 
-	output, err := cmd.CombinedOutput()
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	output, err := cmd.Output()
 	if err != nil {
-		t.Fatalf("expected httpx CLI Stackray contract run to pass: %v\n%s", err, output)
+		t.Fatalf("expected httpx CLI Stackray contract run to pass: %v\nstdout:\n%s\nstderr:\n%s", err, output, stderr.Bytes())
 	}
 
 	row := firstJSONLRow(t, output)
