@@ -125,7 +125,7 @@ func (r *Runner) IsInterrupted() bool {
 }
 
 // picked based on try-fail but it seems to close to one it's used https://www.hackerfactor.com/blog/index.php?/archives/432-Looks-Like-It.html#c1992
-var hammingDistanceThreshold int = 22
+const hammingDistanceThreshold = 22
 
 // regex for stripping ANSI codes
 var ansiRegex = regexp.MustCompile(`\x1b\[[0-9;]*m`)
@@ -2203,7 +2203,12 @@ retry:
 
 	pipeline := false
 	if scanopts.Pipeline {
-		port, _ := strconv.Atoi(URL.Port())
+		port := 0
+		if portStr := URL.Port(); portStr != "" {
+			if p, err := strconv.Atoi(portStr); err == nil {
+				port = p
+			}
+		}
 		r.ratelimiter.Take()
 		pipeline = hp.SupportPipeline(protocol, method, URL.Host, port)
 		if pipeline {
