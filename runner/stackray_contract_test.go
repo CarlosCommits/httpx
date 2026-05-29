@@ -117,6 +117,44 @@ func TestStackrayContractHeadlessTitleJSONShape(t *testing.T) {
 	}
 }
 
+func TestStackrayContractRuntimeTechnologyMetricsJSONShape(t *testing.T) {
+	result := Result{
+		URL: "https://example.com",
+		TechDetectMetrics: &RuntimeTechnologyDetectionMetrics{
+			Enabled:                      true,
+			StopReason:                   "completed",
+			DurationMs:                   1234,
+			PhaseDurationsMs:             map[string]int64{"script_bodies": 456},
+			NetworkRequestCount:          10,
+			ScriptBodiesFetched:          3,
+			MatchedTechnologyCount:       5,
+			PendingSameOriginScriptCount: 1,
+		},
+	}
+
+	var row map[string]any
+	if err := json.Unmarshal([]byte(result.JSON(nil)), &row); err != nil {
+		t.Fatalf("expected Stackray JSONL row to be valid JSON: %v", err)
+	}
+	rawMetrics, ok := row["tech_detection_metrics"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected tech_detection_metrics object, got %#v", row["tech_detection_metrics"])
+	}
+	if rawMetrics["stop_reason"] != "completed" {
+		t.Fatalf("expected stop_reason to be serialized, got %#v", rawMetrics["stop_reason"])
+	}
+	if got, ok := rawMetrics["duration_ms"].(float64); !ok || int(got) != 1234 {
+		t.Fatalf("expected duration_ms 1234, got %#v", rawMetrics["duration_ms"])
+	}
+	phaseDurations, ok := rawMetrics["phase_durations_ms"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected phase_durations_ms object, got %#v", rawMetrics["phase_durations_ms"])
+	}
+	if got, ok := phaseDurations["script_bodies"].(float64); !ok || int(got) != 456 {
+		t.Fatalf("expected script_bodies phase duration 456, got %#v", phaseDurations["script_bodies"])
+	}
+}
+
 func TestStackrayContractHeadlessFaviconHash(t *testing.T) {
 	faviconBytes, err := base64.StdEncoding.DecodeString("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=")
 	if err != nil {
