@@ -1,7 +1,11 @@
 package runner
 
 import (
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"testing"
+	"time"
 
 	wappalyzer "github.com/projectdiscovery/wappalyzergo"
 )
@@ -222,6 +226,39 @@ func TestSameOriginScriptCandidatesIncludesModulePreloadsAndDynamicImports(t *te
 	}
 }
 
+func TestFetchSameOriginScriptBodiesUsesBoundedConcurrency(t *testing.T) {
+	const scriptCount = 6
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(300 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/javascript")
+		_, _ = fmt.Fprintf(w, `console.log("script %s");`, r.URL.Path)
+	}))
+	t.Cleanup(server.Close)
+
+	body := ""
+	for i := 0; i < scriptCount; i++ {
+		body += fmt.Sprintf(`<script src="/assets/script-%d.js"></script>`, i)
+	}
+
+	startedAt := time.Now()
+	collection := fetchSameOriginScriptBodies(body, nil, server.URL, map[string]struct{}{})
+	elapsed := time.Since(startedAt)
+
+	if len(collection.Bodies) != scriptCount {
+		t.Fatalf("expected %d fallback script bodies, got %d", scriptCount, len(collection.Bodies))
+	}
+	if len(collection.CapturedURLs) != scriptCount {
+		t.Fatalf("expected %d captured fallback URLs, got %d", scriptCount, len(collection.CapturedURLs))
+	}
+	if collection.Bytes == 0 {
+		t.Fatal("expected fallback script bytes to be recorded")
+	}
+	if elapsed > 1400*time.Millisecond {
+		t.Fatalf("expected fallback script fetches to run concurrently, took %s", elapsed)
+	}
+}
+
 func TestReadinessAllowsOnlyThirdPartyChallengePending(t *testing.T) {
 	requests := []NetworkRequest{
 		{URL: "https://example.com/assets/index.js", ResourceType: "Script", StatusCode: 200},
@@ -243,6 +280,28 @@ func TestReadinessBlocksOnPendingSameOriginScript(t *testing.T) {
 	}
 	if onlyThirdPartyChallengeRequestsPending(requests, "https://example.com") {
 		t.Fatal("expected pending same-origin script to remain blocking")
+	}
+}
+
+func TestReadinessStopsForQuietPageWithFallbackScriptCandidates(t *testing.T) {
+	requests := []NetworkRequest{
+		{URL: "https://example.com/assets/index.js", ResourceType: "Script", StatusCode: 0},
+		{URL: "https://analytics.example.net/beacon", ResourceType: "Fetch", StatusCode: -1},
+	}
+	scriptCandidates := []string{"https://example.com/assets/index.js"}
+
+	if !shouldStopHeadlessReadiness(requests, scriptCandidates, "https://example.com", false) {
+		t.Fatal("expected quiet page with script candidates to proceed to fallback collection")
+	}
+}
+
+func TestReadinessDoesNotStopForQuietPageWithoutRuntimeEvidence(t *testing.T) {
+	requests := []NetworkRequest{
+		{URL: "https://example.com/api/state", ResourceType: "Fetch", StatusCode: 200},
+	}
+
+	if shouldStopHeadlessReadiness(requests, nil, "https://example.com", false) {
+		t.Fatal("expected quiet page without script candidates or hydrated app evidence to keep waiting")
 	}
 }
 

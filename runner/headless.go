@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -186,7 +187,29 @@ type HeadlessVisitResult struct {
 	Favicons        []HeadlessFavicon
 	NetworkRequests []NetworkRequest
 	RuntimeMatches  map[string]wappalyzer.AppInfo
+	RuntimeMetrics  *RuntimeTechnologyDetectionMetrics
 }
+
+type runtimeBodyCollection struct {
+	Bodies       []string
+	CapturedURLs map[string]struct{}
+	Bytes        int
+}
+
+type runtimeScriptBodyCollection struct {
+	Bodies         []string
+	CandidateCount int
+	CapturedCount  int
+	FetchedCount   int
+	Bytes          int
+}
+
+type cachedRuntimePattern struct {
+	pattern *wappalyzer.ParsedPattern
+	ok      bool
+}
+
+var runtimePatternCache sync.Map
 
 type headlessFaviconCandidate struct {
 	Path string `json:"path"`
@@ -314,7 +337,7 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 		result.Favicons = b.collectHeadlessFavicons(page, body, networkRequests)
 	}
 	if options.DetectRuntimeTechnology {
-		result.RuntimeMatches = b.detectRuntimeTechnologies(page, networkRequests, body, options.WappalyzerClient)
+		result.RuntimeMatches, result.RuntimeMetrics = b.detectRuntimeTechnologies(page, networkRequests, body, options.WappalyzerClient)
 	}
 
 	return result, nil
@@ -737,13 +760,17 @@ func (b *Browser) waitForHeadlessReadiness(page *rod.Page, networkTracker *headl
 
 		quiet := networkTracker.quietFor(headlessReadinessQuietDuration)
 		if quiet && !hasPendingSameOriginScripts(networkRequests, pageOrigin) {
-			if b.hasHydratedAppRoot(page) || onlyThirdPartyChallengeRequestsPending(networkRequests, pageOrigin) {
+			if shouldStopHeadlessReadiness(networkRequests, scriptCandidates, pageOrigin, b.hasHydratedAppRoot(page)) {
 				return
 			}
 		}
 
 		time.Sleep(headlessReadinessPollInterval)
 	}
+}
+
+func shouldStopHeadlessReadiness(networkRequests []NetworkRequest, scriptCandidates []string, pageOrigin string, hydratedAppRoot bool) bool {
+	return len(scriptCandidates) > 0 || hydratedAppRoot || onlyThirdPartyChallengeRequestsPending(networkRequests, pageOrigin)
 }
 
 func (b *Browser) hasHydratedAppRoot(page *rod.Page) bool {
@@ -845,26 +872,64 @@ func (b *Browser) ExecuteJavascriptCodesWithPage(page *rod.Page, jsc []string) (
 	return outputs, nil
 }
 
-func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []NetworkRequest, pageBody string, wappalyzerClient *wappalyzer.Wappalyze) map[string]wappalyzer.AppInfo {
+func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []NetworkRequest, pageBody string, wappalyzerClient *wappalyzer.Wappalyze) (map[string]wappalyzer.AppInfo, *RuntimeTechnologyDetectionMetrics) {
+	startedAt := time.Now()
 	technologies := map[string]wappalyzer.AppInfo{}
+	metrics := &RuntimeTechnologyDetectionMetrics{
+		Enabled:             true,
+		PhaseDurationsMs:    map[string]int64{},
+		NetworkRequestCount: len(networkRequests),
+	}
+	defer func() {
+		metrics.DurationMs = time.Since(startedAt).Milliseconds()
+		metrics.MatchedTechnologyCount = len(technologies)
+		if metrics.StopReason == "" {
+			metrics.StopReason = "completed"
+		}
+	}()
+
 	if wappalyzerClient == nil {
-		return technologies
+		metrics.StopReason = "missing_wappalyzer_client"
+		return technologies, metrics
 	}
 
+	phaseStartedAt := time.Now()
 	addHeadlessBodyTechnologies(technologies, wappalyzerClient, pageBody)
+	metrics.PhaseDurationsMs["headless_body_match"] = time.Since(phaseStartedAt).Milliseconds()
 
 	originalFingerprints := wappalyzerClient.GetFingerprints()
 	if originalFingerprints == nil {
-		return technologies
+		metrics.StopReason = "missing_fingerprints"
+		return technologies, metrics
 	}
+	metrics.AppFingerprintCount = len(originalFingerprints.Apps)
+	matchedRuntimeVersions := map[string]string{}
 
-	jsValues := b.collectRuntimeJSValues(page, wappalyzerClient)
-	domValues := b.collectRuntimeDOMValues(page, originalFingerprints)
-	browserCookies := b.collectRuntimeCookies(page)
+	phaseStartedAt = time.Now()
 	pageOrigin := b.collectRuntimePageOrigin(page)
-	scriptBodies := b.collectRuntimeScriptResourceBodies(page, networkRequests, pageOrigin, pageBody)
-	cssBodies := b.collectRuntimeResourceBodies(page, networkRequests, pageOrigin, isLikelyCSSRequest)
+	metrics.PhaseDurationsMs["page_origin"] = time.Since(phaseStartedAt).Milliseconds()
+	metrics.SameOriginRequestCount = countSameOriginRequests(networkRequests, pageOrigin)
+	metrics.ScriptRequestCount = countRequestsByResourceType(networkRequests, "script")
+	metrics.PendingSameOriginScriptCount = countPendingSameOriginScripts(networkRequests, pageOrigin)
 
+	phaseStartedAt = time.Now()
+	jsValues, jsPropertyPathCount := b.collectRuntimeJSValues(page, wappalyzerClient)
+	metrics.PhaseDurationsMs["js_values"] = time.Since(phaseStartedAt).Milliseconds()
+	metrics.JSPropertyPathCount = jsPropertyPathCount
+	metrics.JSValueCount = len(jsValues)
+
+	phaseStartedAt = time.Now()
+	domValues, domSelectorCount := b.collectRuntimeDOMValues(page, originalFingerprints)
+	metrics.PhaseDurationsMs["dom_values"] = time.Since(phaseStartedAt).Milliseconds()
+	metrics.DOMSelectorCount = domSelectorCount
+	metrics.DOMValueCount = len(domValues)
+
+	phaseStartedAt = time.Now()
+	browserCookies := b.collectRuntimeCookies(page)
+	metrics.PhaseDurationsMs["cookies"] = time.Since(phaseStartedAt).Milliseconds()
+	metrics.CookieCount = len(browserCookies)
+
+	phaseStartedAt = time.Now()
 	for app, fingerprint := range originalFingerprints.Apps {
 		version := ""
 		matched := false
@@ -875,11 +940,12 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 				continue
 			}
 
-			pattern, err := wappalyzer.ParsePattern(patternString)
-			if err != nil {
+			pattern, ok := parseRuntimePattern(patternString)
+			if !ok {
 				continue
 			}
 
+			metrics.RuleEvaluationCount++
 			valid, versionString := pattern.Evaluate(value)
 			if !valid || pattern.Confidence == 0 {
 				continue
@@ -909,12 +975,39 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 			version = moreSpecificVersion(version, versionString)
 		}
 
-		if ok, versionString := b.matchScriptBodyFingerprint(fingerprint, scriptBodies); ok {
+		if !matched {
+			continue
+		}
+
+		matchedRuntimeVersions[app] = moreSpecificVersion(matchedRuntimeVersions[app], version)
+	}
+	metrics.PhaseDurationsMs["cheap_rule_match"] = time.Since(phaseStartedAt).Milliseconds()
+
+	phaseStartedAt = time.Now()
+	scriptCollection := b.collectRuntimeScriptResourceBodies(page, networkRequests, pageOrigin, pageBody)
+	metrics.PhaseDurationsMs["script_bodies"] = time.Since(phaseStartedAt).Milliseconds()
+	metrics.SameOriginScriptCandidateCount = scriptCollection.CandidateCount
+	metrics.ScriptBodiesCaptured = scriptCollection.CapturedCount
+	metrics.ScriptBodiesFetched = scriptCollection.FetchedCount
+	metrics.ScriptBodyBytes = scriptCollection.Bytes
+
+	phaseStartedAt = time.Now()
+	cssCollection := b.collectRuntimeResourceBodiesWithURLs(page, networkRequests, pageOrigin, isLikelyCSSRequest)
+	metrics.PhaseDurationsMs["css_bodies"] = time.Since(phaseStartedAt).Milliseconds()
+	metrics.CSSBodiesCaptured = len(cssCollection.Bodies)
+	metrics.CSSBodyBytes = cssCollection.Bytes
+
+	phaseStartedAt = time.Now()
+	for app, fingerprint := range originalFingerprints.Apps {
+		version := ""
+		matched := false
+
+		if ok, versionString := b.matchScriptBodyFingerprint(fingerprint, scriptCollection.Bodies); ok {
 			matched = true
 			version = moreSpecificVersion(version, versionString)
 		}
 
-		if ok, versionString := b.matchCSSFingerprint(fingerprint, cssBodies); ok {
+		if ok, versionString := b.matchCSSFingerprint(fingerprint, cssCollection.Bodies); ok {
 			matched = true
 			version = moreSpecificVersion(version, versionString)
 		}
@@ -923,8 +1016,15 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 			continue
 		}
 
+		matchedRuntimeVersions[app] = moreSpecificVersion(matchedRuntimeVersions[app], version)
+	}
+	metrics.PhaseDurationsMs["body_rule_match"] = time.Since(phaseStartedAt).Milliseconds()
+
+	phaseStartedAt = time.Now()
+	for app, version := range matchedRuntimeVersions {
 		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, app, version)
 	}
+	metrics.PhaseDurationsMs["catalog_match_apply"] = time.Since(phaseStartedAt).Milliseconds()
 
 	if b.hasReactRuntimeDOMInternalEvidence(page) {
 		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "React", "")
@@ -932,9 +1032,12 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 	if b.hasTanStackRouterRuntimeEvidence(page) {
 		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "TanStack Router", "")
 	}
-	addRuntimeBundleTechnologies(technologies, wappalyzerClient, originalFingerprints, pageBody, networkRequests, scriptBodies)
 
-	return technologies
+	phaseStartedAt = time.Now()
+	addRuntimeBundleTechnologies(technologies, wappalyzerClient, originalFingerprints, pageBody, networkRequests, scriptCollection.Bodies)
+	metrics.PhaseDurationsMs["bundle_heuristics"] = time.Since(phaseStartedAt).Milliseconds()
+
+	return technologies, metrics
 }
 
 func addHeadlessBodyTechnologies(technologies map[string]wappalyzer.AppInfo, wappalyzerClient *wappalyzer.Wappalyze, pageBody string) {
@@ -984,7 +1087,7 @@ func addRuntimeBundleTechnologies(technologies map[string]wappalyzer.AppInfo, wa
 	}
 }
 
-func (b *Browser) collectRuntimeJSValues(page *rod.Page, wappalyzerClient *wappalyzer.Wappalyze) map[string]string {
+func (b *Browser) collectRuntimeJSValues(page *rod.Page, wappalyzerClient *wappalyzer.Wappalyze) (map[string]string, int) {
 	propertyPaths := make([]string, 0)
 	seen := map[string]struct{}{}
 
@@ -1015,7 +1118,7 @@ func (b *Browser) collectRuntimeJSValues(page *rod.Page, wappalyzerClient *wappa
 		}
 	}
 
-	return values
+	return values, len(propertyPaths)
 }
 
 func (b *Browser) collectRuntimeJSValueChunk(page *rod.Page, propertyPaths []string) (map[string]string, error) {
@@ -1070,7 +1173,7 @@ return JSON.stringify(values);
 	return values, nil
 }
 
-func (b *Browser) collectRuntimeDOMValues(page *rod.Page, fingerprints *wappalyzer.Fingerprints) map[string]runtimeDOMValue {
+func (b *Browser) collectRuntimeDOMValues(page *rod.Page, fingerprints *wappalyzer.Fingerprints) (map[string]runtimeDOMValue, int) {
 	specsBySelector := map[string]*runtimeDOMSpec{}
 
 	for _, fingerprint := range fingerprints.Apps {
@@ -1125,7 +1228,7 @@ func (b *Browser) collectRuntimeDOMValues(page *rod.Page, fingerprints *wappalyz
 		}
 	}
 
-	return values
+	return values, len(specs)
 }
 
 func (b *Browser) collectRuntimeDOMValueChunk(page *rod.Page, specs []runtimeDOMSpec) (map[string]runtimeDOMValue, error) {
@@ -1262,12 +1365,7 @@ func (b *Browser) collectRuntimePageOrigin(page *rod.Page) string {
 	return strings.ToLower(origin)
 }
 
-func (b *Browser) collectRuntimeResourceBodies(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, predicate func(NetworkRequest) bool) []string {
-	bodies, _ := b.collectRuntimeResourceBodiesWithURLs(page, networkRequests, pageOrigin, predicate)
-	return bodies
-}
-
-func (b *Browser) collectRuntimeResourceBodiesWithURLs(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, predicate func(NetworkRequest) bool) ([]string, map[string]struct{}) {
+func (b *Browser) collectRuntimeResourceBodiesWithURLs(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, predicate func(NetworkRequest) bool) runtimeBodyCollection {
 	const (
 		maxResources      = 20
 		maxResourceBytes  = 2 * 1024 * 1024
@@ -1322,40 +1420,81 @@ func (b *Browser) collectRuntimeResourceBodiesWithURLs(page *rod.Page, networkRe
 		totalBytes += len(body)
 	}
 
-	return bodies, captured
+	return runtimeBodyCollection{
+		Bodies:       bodies,
+		CapturedURLs: captured,
+		Bytes:        totalBytes,
+	}
 }
 
-func (b *Browser) collectRuntimeScriptResourceBodies(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, pageBody string) []string {
-	bodies, capturedURLs := b.collectRuntimeResourceBodiesWithURLs(page, networkRequests, pageOrigin, isLikelyScriptRequest)
-	fallbackBodies := fetchSameOriginScriptBodies(pageBody, networkRequests, pageOrigin, capturedURLs)
-	return append(bodies, fallbackBodies...)
+func (b *Browser) collectRuntimeScriptResourceBodies(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, pageBody string) runtimeScriptBodyCollection {
+	candidates := sameOriginScriptCandidates(pageBody, networkRequests, pageOrigin)
+	networkCollection := b.collectRuntimeResourceBodiesWithURLs(page, networkRequests, pageOrigin, isLikelyScriptRequest)
+	fallbackCollection := fetchSameOriginScriptBodies(pageBody, networkRequests, pageOrigin, networkCollection.CapturedURLs)
+	bodies := append(networkCollection.Bodies, fallbackCollection.Bodies...)
+
+	return runtimeScriptBodyCollection{
+		Bodies:         bodies,
+		CandidateCount: len(candidates),
+		CapturedCount:  len(networkCollection.Bodies),
+		FetchedCount:   len(fallbackCollection.Bodies),
+		Bytes:          networkCollection.Bytes + fallbackCollection.Bytes,
+	}
 }
 
-func fetchSameOriginScriptBodies(pageBody string, networkRequests []NetworkRequest, pageOrigin string, capturedURLs map[string]struct{}) []string {
+func fetchSameOriginScriptBodies(pageBody string, networkRequests []NetworkRequest, pageOrigin string, capturedURLs map[string]struct{}) runtimeBodyCollection {
 	const (
 		maxFetches        = 10
 		maxResourceBytes  = 2 * 1024 * 1024
 		maxTotalBodyBytes = 8 * 1024 * 1024
+		maxConcurrency    = 4
+		totalFetchTimeout = 8 * time.Second
+		requestTimeout    = 3 * time.Second
 	)
 
 	scriptCandidates := sameOriginScriptCandidates(pageBody, networkRequests, pageOrigin)
 	if len(scriptCandidates) == 0 {
-		return nil
+		return runtimeBodyCollection{}
 	}
 
-	client := &http.Client{Timeout: 10 * time.Second}
-	bodies := make([]string, 0)
-	totalBytes := 0
-
+	fetchURLs := make([]string, 0, maxFetches)
 	for _, scriptURL := range scriptCandidates {
-		if len(bodies) >= maxFetches || totalBytes >= maxTotalBodyBytes {
+		if len(fetchURLs) >= maxFetches {
 			break
 		}
 		if _, ok := capturedURLs[strings.ToLower(scriptURL)]; ok {
 			continue
 		}
+		fetchURLs = append(fetchURLs, scriptURL)
+	}
+	if len(fetchURLs) == 0 {
+		return runtimeBodyCollection{}
+	}
 
-		request, err := http.NewRequest(http.MethodGet, scriptURL, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), totalFetchTimeout)
+	defer cancel()
+
+	client := &http.Client{Timeout: requestTimeout}
+	bodies := make([]string, 0)
+	captured := map[string]struct{}{}
+	totalBytes := 0
+	type fetchResult struct {
+		url  string
+		body []byte
+	}
+	results := make(chan fetchResult, len(fetchURLs))
+	sem := make(chan struct{}, maxConcurrency)
+	var wg sync.WaitGroup
+
+launchLoop:
+	for _, scriptURL := range fetchURLs {
+		select {
+		case <-ctx.Done():
+			break launchLoop
+		default:
+		}
+
+		request, err := http.NewRequestWithContext(ctx, http.MethodGet, scriptURL, nil)
 		if err != nil {
 			continue
 		}
@@ -1363,24 +1502,56 @@ func fetchSameOriginScriptBodies(pageBody string, networkRequests []NetworkReque
 		request.Header.Set("Referer", pageOrigin+"/")
 		request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
 
-		response, err := client.Do(request)
-		if err != nil {
-			continue
-		}
-		body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResourceBytes+1))
-		_ = response.Body.Close()
-		if readErr != nil || response.StatusCode != http.StatusOK || len(body) == 0 || len(body) > maxResourceBytes {
-			continue
-		}
-		if totalBytes+len(body) > maxTotalBodyBytes {
-			continue
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-ctx.Done():
+				return
+			}
 
-		bodies = append(bodies, strings.ToLower(string(body)))
-		totalBytes += len(body)
+			response, err := client.Do(request)
+			if err != nil {
+				return
+			}
+			body, readErr := io.ReadAll(io.LimitReader(response.Body, maxResourceBytes+1))
+			_ = response.Body.Close()
+			if readErr != nil || response.StatusCode != http.StatusOK || len(body) == 0 || len(body) > maxResourceBytes {
+				return
+			}
+
+			select {
+			case results <- fetchResult{url: scriptURL, body: body}:
+			case <-ctx.Done():
+			}
+		}()
 	}
 
-	return bodies
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	for result := range results {
+		if totalBytes >= maxTotalBodyBytes {
+			cancel()
+			continue
+		}
+		if totalBytes+len(result.body) > maxTotalBodyBytes {
+			continue
+		}
+		bodies = append(bodies, strings.ToLower(string(result.body)))
+		captured[strings.ToLower(result.url)] = struct{}{}
+		totalBytes += len(result.body)
+	}
+
+	return runtimeBodyCollection{
+		Bodies:       bodies,
+		CapturedURLs: captured,
+		Bytes:        totalBytes,
+	}
 }
 
 func isSameOriginRequest(rawRequestURL string, pageOrigin string) bool {
@@ -1391,6 +1562,44 @@ func isSameOriginRequest(rawRequestURL string, pageOrigin string) bool {
 
 	requestOrigin := strings.ToLower(requestURL.Scheme + "://" + requestURL.Host)
 	return requestOrigin == pageOrigin
+}
+
+func countRequestsByResourceType(networkRequests []NetworkRequest, resourceType string) int {
+	count := 0
+	for _, request := range networkRequests {
+		if strings.EqualFold(request.ResourceType, resourceType) {
+			count++
+		}
+	}
+	return count
+}
+
+func countSameOriginRequests(networkRequests []NetworkRequest, pageOrigin string) int {
+	if pageOrigin == "" {
+		return 0
+	}
+
+	count := 0
+	for _, request := range networkRequests {
+		if isSameOriginRequest(request.URL, pageOrigin) {
+			count++
+		}
+	}
+	return count
+}
+
+func countPendingSameOriginScripts(networkRequests []NetworkRequest, pageOrigin string) int {
+	if pageOrigin == "" {
+		return 0
+	}
+
+	count := 0
+	for _, request := range networkRequests {
+		if strings.EqualFold(request.ResourceType, "script") && request.StatusCode <= 0 && isSameOriginRequest(request.URL, pageOrigin) {
+			count++
+		}
+	}
+	return count
 }
 
 func isLikelyScriptRequest(request NetworkRequest) bool {
@@ -1899,13 +2108,30 @@ func (b *Browser) matchCSSFingerprint(fingerprint *wappalyzer.Fingerprint, cssBo
 }
 
 func evaluateRuntimePattern(patternString string, value string) (bool, string) {
-	pattern, err := wappalyzer.ParsePattern(patternString)
-	if err != nil {
+	pattern, ok := parseRuntimePattern(patternString)
+	if !ok {
 		return false, ""
 	}
 
 	valid, versionString := pattern.Evaluate(value)
 	return valid && pattern.Confidence > 0, versionString
+}
+
+func parseRuntimePattern(patternString string) (*wappalyzer.ParsedPattern, bool) {
+	if cachedValue, ok := runtimePatternCache.Load(patternString); ok {
+		cached := cachedValue.(cachedRuntimePattern)
+		return cached.pattern, cached.ok
+	}
+
+	pattern, err := wappalyzer.ParsePattern(patternString)
+	cached := cachedRuntimePattern{
+		pattern: pattern,
+		ok:      err == nil,
+	}
+	actualValue, _ := runtimePatternCache.LoadOrStore(patternString, cached)
+	actual := actualValue.(cachedRuntimePattern)
+
+	return actual.pattern, actual.ok
 }
 
 func moreSpecificVersion(current string, candidate string) string {

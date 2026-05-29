@@ -2546,6 +2546,7 @@ retry:
 		headlessBody    string
 		headlessTitle   string
 		runtimeMatches  map[string]wappalyzer.AppInfo
+		runtimeMetrics  *RuntimeTechnologyDetectionMetrics
 	)
 	var pHash uint64
 	if scanopts.Screenshot || scanopts.HeadlessTechDetect {
@@ -2569,6 +2570,7 @@ retry:
 			headlessTitle = headlessResult.Title
 			linkRequest = headlessResult.NetworkRequests
 			runtimeMatches = headlessResult.RuntimeMatches
+			runtimeMetrics = headlessResult.RuntimeMetrics
 			if scanopts.Favicon && faviconMMH3 == "" {
 				faviconMMH3, faviconMD5, faviconPath, faviconData, faviconURL = r.HandleHeadlessFaviconHash(headlessResult.Favicons)
 				if faviconMMH3 != "" && !faviconPrinted {
@@ -2733,6 +2735,7 @@ retry:
 		ExtractRegex:      extractRegex,
 		ScreenshotBytes:   screenshotBytes,
 		HeadlessBody:      headlessBody,
+		TechDetectMetrics: runtimeMetrics,
 		KnowledgeBase:     r.classifyPage(headlessBody, respData, pHash),
 		TechnologyDetails: technologyDetails,
 		Resolvers:         resolvers,
