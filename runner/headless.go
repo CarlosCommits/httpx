@@ -1365,11 +1365,6 @@ func (b *Browser) collectRuntimePageOrigin(page *rod.Page) string {
 	return strings.ToLower(origin)
 }
 
-func (b *Browser) collectRuntimeResourceBodies(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, predicate func(NetworkRequest) bool) []string {
-	collection := b.collectRuntimeResourceBodiesWithURLs(page, networkRequests, pageOrigin, predicate)
-	return collection.Bodies
-}
-
 func (b *Browser) collectRuntimeResourceBodiesWithURLs(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, predicate func(NetworkRequest) bool) runtimeBodyCollection {
 	const (
 		maxResources      = 20
