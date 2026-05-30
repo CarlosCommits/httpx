@@ -322,8 +322,14 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 	defer b.closePage(page)
 
 	screenshot, body, title, networkRequests, err := b.capturePageArtifacts(page, networkTracker, options.Idle, options.FullPage, options.CaptureScreenshot, options.DetectRuntimeTechnology)
-	if err != nil {
+	if err != nil && !options.DetectRuntimeTechnology {
 		return nil, err
+	}
+	if err != nil {
+		networkRequests = networkTracker.snapshot()
+		if title == "" {
+			title = b.captureDocumentTitle(page)
+		}
 	}
 
 	result := &HeadlessVisitResult{
@@ -338,9 +344,15 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 	}
 	if options.DetectRuntimeTechnology {
 		result.RuntimeMatches, result.RuntimeMetrics = b.detectRuntimeTechnologies(page, networkRequests, body, options.WappalyzerClient)
+		if err != nil && result.RuntimeMetrics != nil {
+			result.RuntimeMetrics.Partial = true
+			if result.RuntimeMetrics.StopReason == "" || result.RuntimeMetrics.StopReason == "completed" {
+				result.RuntimeMetrics.StopReason = "artifact_capture_failed"
+			}
+		}
 	}
 
-	return result, nil
+	return result, err
 }
 
 // setupPageAndNavigate opens a page, performs all adaptive actions including JS injection

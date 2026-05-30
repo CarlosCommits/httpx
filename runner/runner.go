@@ -2564,7 +2564,8 @@ retry:
 		})
 		if err != nil {
 			gologger.Warning().Msgf("Could not run headless probes '%s': %s", fullURL, err)
-		} else {
+		}
+		if headlessResult != nil {
 			screenshotBytes = headlessResult.ScreenshotBytes
 			headlessBody = headlessResult.Body
 			headlessTitle = headlessResult.Title
