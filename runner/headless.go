@@ -322,8 +322,14 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 	defer b.closePage(page)
 
 	screenshot, body, title, networkRequests, err := b.capturePageArtifacts(page, networkTracker, options.Idle, options.FullPage, options.CaptureScreenshot, options.DetectRuntimeTechnology)
-	if err != nil {
+	if err != nil && !options.DetectRuntimeTechnology {
 		return nil, err
+	}
+	if err != nil {
+		networkRequests = networkTracker.snapshot()
+		if title == "" {
+			title = b.captureDocumentTitle(page)
+		}
 	}
 
 	result := &HeadlessVisitResult{
@@ -338,9 +344,15 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 	}
 	if options.DetectRuntimeTechnology {
 		result.RuntimeMatches, result.RuntimeMetrics = b.detectRuntimeTechnologies(page, networkRequests, body, options.WappalyzerClient)
+		if err != nil && result.RuntimeMetrics != nil {
+			result.RuntimeMetrics.Partial = true
+			if result.RuntimeMetrics.StopReason == "" || result.RuntimeMetrics.StopReason == "completed" {
+				result.RuntimeMetrics.StopReason = "artifact_capture_failed"
+			}
+		}
 	}
 
-	return result, nil
+	return result, err
 }
 
 // setupPageAndNavigate opens a page, performs all adaptive actions including JS injection
@@ -420,9 +432,10 @@ func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, header
 
 // capturePageArtifacts waits for the page and returns rendered HTML, document title, and optional screenshot bytes.
 func (b *Browser) capturePageArtifacts(page *rod.Page, networkTracker *headlessNetworkTracker, idle time.Duration, fullPage bool, captureScreenshot bool, waitForRuntimeReadiness bool) ([]byte, string, string, []NetworkRequest, error) {
-	if err := page.WaitLoad(); err != nil {
-		return nil, "", "", nil, err
-	}
+	// Some pages can make Rod's load helper fail even after navigation and paint
+	// succeeded. Continue and let the artifact reads below decide whether the page
+	// is usable.
+	_ = page.WaitLoad()
 	_ = page.WaitIdle(idle)
 
 	if waitForRuntimeReadiness {
@@ -432,7 +445,9 @@ func (b *Browser) capturePageArtifacts(page *rod.Page, networkTracker *headlessN
 	var screenshot []byte
 	if captureScreenshot {
 		var err error
-		screenshot, err = page.Screenshot(fullPage, &proto.PageCaptureScreenshot{})
+		screenshot, err = page.Screenshot(fullPage, &proto.PageCaptureScreenshot{
+			Format: proto.PageCaptureScreenshotFormatPng,
+		})
 		if err != nil {
 			return nil, "", "", nil, err
 		}

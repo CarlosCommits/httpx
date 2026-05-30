@@ -122,7 +122,8 @@ func TestStackrayContractRuntimeTechnologyMetricsJSONShape(t *testing.T) {
 		URL: "https://example.com",
 		TechDetectMetrics: &RuntimeTechnologyDetectionMetrics{
 			Enabled:                      true,
-			StopReason:                   "completed",
+			Partial:                      true,
+			StopReason:                   "artifact_capture_failed",
 			DurationMs:                   1234,
 			PhaseDurationsMs:             map[string]int64{"script_bodies": 456},
 			NetworkRequestCount:          10,
@@ -140,8 +141,11 @@ func TestStackrayContractRuntimeTechnologyMetricsJSONShape(t *testing.T) {
 	if !ok {
 		t.Fatalf("expected tech_detection_metrics object, got %#v", row["tech_detection_metrics"])
 	}
-	if rawMetrics["stop_reason"] != "completed" {
+	if rawMetrics["stop_reason"] != "artifact_capture_failed" {
 		t.Fatalf("expected stop_reason to be serialized, got %#v", rawMetrics["stop_reason"])
+	}
+	if rawMetrics["partial"] != true {
+		t.Fatalf("expected partial to be serialized, got %#v", rawMetrics["partial"])
 	}
 	if got, ok := rawMetrics["duration_ms"].(float64); !ok || int(got) != 1234 {
 		t.Fatalf("expected duration_ms 1234, got %#v", rawMetrics["duration_ms"])

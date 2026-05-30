@@ -1332,7 +1332,7 @@ func (r *Runner) RunEnumeration() {
 					resp.StoredResponsePath = responsePath
 				}
 
-				if r.scanopts.Screenshot {
+				if r.scanopts.Screenshot && len(resp.ScreenshotBytes) > 0 {
 					screenshotPath = fileutilz.AbsPathOrDefault(filepath.Join(screenshotBaseDir, screenshotResponseFile))
 					screenshotPathRel = filepath.Join(hostFilename, screenshotResponseFile)
 					_ = fileutil.CreateFolder(screenshotBaseDir)
@@ -2564,7 +2564,8 @@ retry:
 		})
 		if err != nil {
 			gologger.Warning().Msgf("Could not run headless probes '%s': %s", fullURL, err)
-		} else {
+		}
+		if headlessResult != nil {
 			screenshotBytes = headlessResult.ScreenshotBytes
 			headlessBody = headlessResult.Body
 			headlessTitle = headlessResult.Title
@@ -2584,7 +2585,7 @@ retry:
 				}
 			}
 
-			if scanopts.Screenshot {
+			if scanopts.Screenshot && len(screenshotBytes) > 0 {
 				pHash, err = calculatePerceptionHash(screenshotBytes)
 				if err != nil {
 					gologger.Warning().Msgf("%v: %s", err, fullURL)
