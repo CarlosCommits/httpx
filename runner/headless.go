@@ -432,9 +432,10 @@ func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, header
 
 // capturePageArtifacts waits for the page and returns rendered HTML, document title, and optional screenshot bytes.
 func (b *Browser) capturePageArtifacts(page *rod.Page, networkTracker *headlessNetworkTracker, idle time.Duration, fullPage bool, captureScreenshot bool, waitForRuntimeReadiness bool) ([]byte, string, string, []NetworkRequest, error) {
-	if err := page.WaitLoad(); err != nil {
-		return nil, "", "", nil, err
-	}
+	// Some pages can make Rod's load helper fail even after navigation and paint
+	// succeeded. Continue and let the artifact reads below decide whether the page
+	// is usable.
+	_ = page.WaitLoad()
 	_ = page.WaitIdle(idle)
 
 	if waitForRuntimeReadiness {
@@ -444,7 +445,9 @@ func (b *Browser) capturePageArtifacts(page *rod.Page, networkTracker *headlessN
 	var screenshot []byte
 	if captureScreenshot {
 		var err error
-		screenshot, err = page.Screenshot(fullPage, &proto.PageCaptureScreenshot{})
+		screenshot, err = page.Screenshot(fullPage, &proto.PageCaptureScreenshot{
+			Format: proto.PageCaptureScreenshotFormatPng,
+		})
 		if err != nil {
 			return nil, "", "", nil, err
 		}
