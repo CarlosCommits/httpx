@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
 	"os"
 	"strconv"
@@ -36,7 +37,7 @@ type HTTPX struct {
 	Filters       []Filter
 	Options       *Options
 	htmlPolicy    *bluemonday.Policy
-	CustomHeaders map[string]string
+	CustomHeaders map[string][]string
 	cdn           *cdncheck.Client
 	Dialer        *fastdialer.Dialer
 	NetworkPolicy *networkpolicy.NetworkPolicy
@@ -434,19 +435,31 @@ func (h *HTTPX) NewRequestWithContext(ctx context.Context, method, targetURL str
 }
 
 // SetCustomHeaders on the provided request
-func (h *HTTPX) SetCustomHeaders(r *retryablehttp.Request, headers map[string]string) {
-	for name, value := range headers {
-		switch strings.ToLower(name) {
-		case "host":
-			r.Host = value
-			if h.Options.Unsafe {
-				r.Header.Set("Host", value)
+func (h *HTTPX) SetCustomHeaders(r *retryablehttp.Request, headers map[string][]string) {
+	// Coalesce values by canonical header key first. net/http canonicalizes keys
+	// on Del/Add, so case-variant duplicates (e.g. "X-Test" and "x-test") would
+	// otherwise have the second key's Del wipe the values added for the first.
+	normalized := make(map[string][]string, len(headers))
+	for name, values := range headers {
+		canonical := textproto.CanonicalMIMEHeaderKey(name)
+		normalized[canonical] = append(normalized[canonical], values...)
+	}
+
+	for name, values := range normalized {
+		r.Header.Del(name)
+		for _, value := range values {
+			switch strings.ToLower(name) {
+			case "host":
+				r.Host = value
+				if h.Options.Unsafe {
+					r.Header.Add("Host", value)
+				}
+			case "cookie":
+				// cookies are set in the default branch, and reset during the follow redirect flow
+				fallthrough
+			default:
+				r.Header.Add(name, value)
 			}
-		case "cookie":
-			// cookies are set in the default branch, and reset during the follow redirect flow
-			fallthrough
-		default:
-			r.Header.Set(name, value)
 		}
 	}
 	if h.Options.RandomAgent {
