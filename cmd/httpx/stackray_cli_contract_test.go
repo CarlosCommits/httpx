@@ -82,6 +82,55 @@ func TestStackrayCLIContractTechDetectJSONL(t *testing.T) {
 	}
 }
 
+func TestStackrayCLIContractPreservesDuplicateHeaders(t *testing.T) {
+	const expectedStatus = 209
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		values := r.Header.Values("X-Stackray-Duplicate")
+		if len(values) == 2 && values[0] == "one" && values[1] == "two" {
+			w.WriteHeader(expectedStatus)
+			return
+		}
+
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = w.Write([]byte("duplicate header values were not preserved"))
+	}))
+	t.Cleanup(server.Close)
+
+	cmd := exec.Command(
+		"go",
+		"run",
+		".",
+		"-silent",
+		"-json",
+		"-H",
+		"X-Stackray-Duplicate: one",
+		"-H",
+		"X-Stackray-Duplicate: two",
+		"-u",
+		server.URL,
+		"-retries",
+		"0",
+		"-timeout",
+		"5",
+		"-duc",
+	)
+	cmd.Dir = "."
+
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	output, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("expected httpx CLI duplicate header run to pass: %v\nstdout:\n%s\nstderr:\n%s", err, output, stderr.Bytes())
+	}
+
+	row := firstJSONLRow(t, output)
+	if got, ok := row["status_code"].(float64); !ok || int(got) != expectedStatus {
+		t.Fatalf("expected duplicate header contract status_code %d, got %#v", expectedStatus, row["status_code"])
+	}
+}
+
 func writeStackrayCLIFingerprintFile(t *testing.T, contents string) string {
 	t.Helper()
 

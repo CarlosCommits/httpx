@@ -148,7 +148,7 @@ func New(options *Options) (*Runner, error) {
 	var err error
 	if options.Wappalyzer != nil {
 		runner.wappalyzer = options.Wappalyzer
-	} else if options.TechDetect || options.HeadlessTechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload {
+	} else if wappalyzerRequired(options) {
 		runner.wappalyzer, err = newWappalyzerClient(options.CustomFingerprintFile)
 	}
 	if err != nil {
@@ -233,12 +233,12 @@ func New(options *Options) (*Runner, error) {
 	httpxOptions.Protocol = httpx.Proto(options.Protocol)
 
 	var key, value string
-	httpxOptions.CustomHeaders = make(map[string]string)
+	httpxOptions.CustomHeaders = make(map[string][]string)
 	for _, customHeader := range options.CustomHeaders {
 		tokens := strings.SplitN(customHeader, ":", two)
 		// rawhttp skips all checks
 		if options.Unsafe {
-			httpxOptions.CustomHeaders[customHeader] = ""
+			httpxOptions.CustomHeaders[customHeader] = []string{""}
 			continue
 		}
 
@@ -248,7 +248,7 @@ func New(options *Options) (*Runner, error) {
 		}
 		key = strings.TrimSpace(tokens[0])
 		value = strings.TrimSpace(tokens[1])
-		httpxOptions.CustomHeaders[key] = value
+		httpxOptions.CustomHeaders[key] = append(httpxOptions.CustomHeaders[key], value)
 	}
 	httpxOptions.SniName = options.SniName
 
@@ -273,7 +273,7 @@ func New(options *Options) (*Runner, error) {
 		scanopts.Methods = append(scanopts.Methods, rrMethod)
 		scanopts.RequestURI = rrPath
 		for name, value := range rrHeaders {
-			httpxOptions.CustomHeaders[name] = value
+			httpxOptions.CustomHeaders[name] = append(httpxOptions.CustomHeaders[name], value...)
 		}
 		scanopts.RequestBody = rrBody
 		options.rawRequest = string(rawRequest)
@@ -335,7 +335,7 @@ func New(options *Options) (*Runner, error) {
 	scanopts.OutputResponseTime = options.OutputResponseTime
 	scanopts.NoFallback = options.NoFallback
 	scanopts.NoFallbackScheme = options.NoFallbackScheme
-	scanopts.TechDetect = options.TechDetect || options.JSONOutput || options.CSVOutput || options.AssetUpload
+	scanopts.TechDetect = techDetectRequired(options)
 	scanopts.HeadlessTechDetect = options.HeadlessTechDetect
 	scanopts.CPEDetect = options.CPEDetect || options.JSONOutput || options.CSVOutput
 	scanopts.WordPress = options.WordPress || options.JSONOutput || options.CSVOutput
@@ -2592,7 +2592,10 @@ retry:
 				}
 			}
 
-			if scanopts.TechDetect {
+			// As we now have headless body, we can also use it for detecting
+			// more technologies in the response. This is a quick trick to get
+			// more detected technologies.
+			if techDetectRequired(r.options) {
 				moreMatches := r.wappalyzer.FingerprintWithInfo(resp.Headers, []byte(headlessBody))
 				for match, data := range moreMatches {
 					technologies = append(technologies, match)
@@ -2643,6 +2646,7 @@ retry:
 	var cpeMatches []CPEInfo
 	if r.cpeDetector != nil {
 		cpeMatches = r.cpeDetector.Detect(title, string(resp.Data), faviconMMH3)
+		cpeMatches = EnrichCPEVersions(cpeMatches, technologies)
 		if len(cpeMatches) > 0 && r.options.CPEDetect {
 			for _, cpe := range cpeMatches {
 				builder.WriteString(" [")
