@@ -98,6 +98,58 @@ func TestStackrayContractTechDetectJSONShape(t *testing.T) {
 	}
 }
 
+func TestStackrayContractCPEDetectLoadsCustomFingerprints(t *testing.T) {
+	fingerprintPath := writeCustomFingerprintFile(t, `{
+  "apps": {
+    "Stackray CPE Contract App": {
+      "cats": [59],
+      "html": ["stackray-cpe-contract-marker"]
+    }
+  }
+}`)
+
+	options := &Options{
+		CPEDetect:             true,
+		CustomFingerprintFile: fingerprintPath,
+		DisableUpdateCheck:    true,
+	}
+	httpxRunner, err := New(options)
+	if err != nil {
+		t.Fatalf("expected Stackray CPE contract runner to initialize: %v", err)
+	}
+	defer httpxRunner.Close()
+
+	matches := httpxRunner.wappalyzer.FingerprintWithInfo(nil, []byte("stackray-cpe-contract-marker"))
+	if _, ok := matches["Stackray CPE Contract App"]; !ok {
+		t.Fatalf("expected -cpe to initialize custom Wappalyzer fingerprints, got %#v", matches)
+	}
+}
+
+func TestStackrayContractHeadlessTechDetectLoadsCustomFingerprints(t *testing.T) {
+	fingerprintPath := writeCustomFingerprintFile(t, `{
+  "apps": {
+    "Stackray Headless Contract App": {
+      "cats": [59],
+      "html": ["stackray-headless-contract-marker"]
+    }
+  }
+}`)
+
+	if !wappalyzerRequired(&Options{HeadlessTechDetect: true}) {
+		t.Fatal("expected -tdh to require Wappalyzer initialization")
+	}
+
+	wappalyzerClient, err := newWappalyzerClient(fingerprintPath)
+	if err != nil {
+		t.Fatalf("expected Stackray headless custom fingerprints to initialize: %v", err)
+	}
+
+	matches := wappalyzerClient.FingerprintWithInfo(nil, []byte("stackray-headless-contract-marker"))
+	if _, ok := matches["Stackray Headless Contract App"]; !ok {
+		t.Fatalf("expected -tdh to initialize custom Wappalyzer fingerprints, got %#v", matches)
+	}
+}
+
 func TestStackrayContractHeadlessTitleJSONShape(t *testing.T) {
 	result := Result{
 		URL:           "https://example.com",
@@ -114,6 +166,38 @@ func TestStackrayContractHeadlessTitleJSONShape(t *testing.T) {
 	}
 	if got := row["headless_title"]; got != "Rendered Browser Title" {
 		t.Fatalf("expected headless_title to contain rendered browser title, got %#v", got)
+	}
+}
+
+func TestStackrayContractVersionedCPEJSONShape(t *testing.T) {
+	result := Result{
+		URL: "https://example.com",
+		CPE: []CPEInfo{
+			{
+				Product: "WordPress",
+				Vendor:  "wordpress",
+				CPE:     "cpe:2.3:a:wordpress:wordpress:6.5.0:*:*:*:*:*:*:*",
+			},
+		},
+	}
+
+	var row map[string]any
+	if err := json.Unmarshal([]byte(result.JSON(nil)), &row); err != nil {
+		t.Fatalf("expected Stackray CPE JSONL row to be valid JSON: %v", err)
+	}
+	rawCPE, ok := row["cpe"].([]any)
+	if !ok || len(rawCPE) != 1 {
+		t.Fatalf("expected Stackray JSONL row to contain one CPE object, got %#v", row["cpe"])
+	}
+	cpeEntry, ok := rawCPE[0].(map[string]any)
+	if !ok {
+		t.Fatalf("expected CPE entry to be an object, got %#v", rawCPE[0])
+	}
+	if cpeEntry["cpe"] != "cpe:2.3:a:wordpress:wordpress:6.5.0:*:*:*:*:*:*:*" {
+		t.Fatalf("expected versioned CPE string to be preserved, got %#v", cpeEntry["cpe"])
+	}
+	if cpeEntry["vendor"] != "wordpress" || cpeEntry["product"] != "WordPress" {
+		t.Fatalf("expected CPE vendor/product to be preserved, got %#v", cpeEntry)
 	}
 }
 
