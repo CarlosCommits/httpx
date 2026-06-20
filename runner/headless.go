@@ -160,6 +160,8 @@ const (
 	headlessReadinessTimeout       = 20 * time.Second
 	headlessReadinessPollInterval  = 250 * time.Millisecond
 	headlessReadinessQuietDuration = 750 * time.Millisecond
+	defaultHeadlessAcceptLanguage  = "en-US,en;q=0.9"
+	fallbackDesktopChromeUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6568.0 Safari/537.36"
 )
 
 type HeadlessVisitOptions struct {
@@ -230,8 +232,9 @@ func MustDisableSandbox() bool {
 }
 
 type Browser struct {
-	tempDir string
-	engine  *rod.Browser
+	tempDir          string
+	engine           *rod.Browser
+	defaultUserAgent string
 	// TODO: Remove the Chrome PID kill code in favor of using Leakless(true).
 	// This change will be made if there are no complaints about zombie Chrome processes.
 	// Reference: https://github.com/projectdiscovery/httpx/pull/1426
@@ -253,12 +256,14 @@ func NewBrowser(proxy string, useLocal bool, optionalArgs map[string]string) (*B
 		Set("ignore-certificate-errors", "1").
 		Set("disable-crash-reporter", "true").
 		Set("disable-notifications", "true").
-		Set("hide-scrollbars", "true").
-		Set("window-size", fmt.Sprintf("%d,%d", 1080, 1920)).
+		Set("disable-blink-features", "AutomationControlled").
+		Set("blink-settings", "primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2").
+		Set("ozone-override-screen-size", "1365,768").
+		Set("window-size", fmt.Sprintf("%d,%d", 1365, 768)).
 		Set("mute-audio", "true").
-		Set("incognito", "true").
+		Delete("enable-automation").
 		Delete("use-mock-keychain").
-		Headless(true).
+		HeadlessNew(true).
 		UserDataDir(dataStore)
 
 	if MustDisableSandbox() {
@@ -306,9 +311,17 @@ func NewBrowser(proxy string, useLocal bool, optionalArgs map[string]string) (*B
 		return nil, browserErr
 	}
 
+	defaultUserAgent := fallbackDesktopChromeUserAgent
+	if version, versionErr := browser.Version(); versionErr == nil {
+		if normalizedUserAgent := normalizeHeadlessUserAgent(version.UserAgent); normalizedUserAgent != "" {
+			defaultUserAgent = normalizedUserAgent
+		}
+	}
+
 	engine := &Browser{
-		tempDir: dataStore,
-		engine:  browser,
+		tempDir:          dataStore,
+		engine:           browser,
+		defaultUserAgent: defaultUserAgent,
 		// pids:    pids,
 	}
 	return engine, nil
@@ -402,14 +415,12 @@ func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, header
 		}.Call(page)
 	})()
 
-	for _, header := range headers {
-		headerParts := strings.SplitN(header, ":", 2)
-		if len(headerParts) != 2 {
-			continue
-		}
-		key := strings.TrimSpace(headerParts[0])
-		value := strings.TrimSpace(headerParts[1])
-		_, _ = page.SetExtraHeaders([]string{key, value})
+	headerOverrides := parseHeadlessBrowserHeaders(headers)
+	if err := b.applyHeadlessBrowserOverrides(page, headerOverrides); err != nil {
+		return page, networkTracker, err
+	}
+	if _, err := page.EvalOnNewDocument(buildHeadlessStealthScript(headerOverrides.AcceptLanguage)); err != nil {
+		return page, networkTracker, err
 	}
 
 	page = page.Timeout(timeout)
@@ -428,6 +439,282 @@ func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, header
 	page.Timeout(5 * time.Second).WaitNavigation(proto.PageLifecycleEventNameFirstMeaningfulPaint)()
 
 	return page, networkTracker, nil
+}
+
+type headlessBrowserHeaderOverrides struct {
+	ExtraHeaders    []string
+	UserAgent       string
+	AcceptLanguage  string
+	SecCHUA         string
+	SecCHUAMobile   string
+	SecCHUAPlatform string
+}
+
+func parseHeadlessBrowserHeaders(headers []string) headlessBrowserHeaderOverrides {
+	overrides := headlessBrowserHeaderOverrides{
+		ExtraHeaders:   []string{},
+		AcceptLanguage: defaultHeadlessAcceptLanguage,
+	}
+
+	for _, header := range headers {
+		headerParts := strings.SplitN(header, ":", 2)
+		if len(headerParts) != 2 {
+			continue
+		}
+
+		key := strings.TrimSpace(headerParts[0])
+		value := strings.TrimSpace(headerParts[1])
+		if key == "" || value == "" {
+			continue
+		}
+
+		switch {
+		case strings.EqualFold(key, "User-Agent"):
+			overrides.UserAgent = value
+		case strings.EqualFold(key, "Accept-Language"):
+			overrides.AcceptLanguage = value
+		case strings.EqualFold(key, "Sec-CH-UA"):
+			overrides.SecCHUA = value
+		case strings.EqualFold(key, "Sec-CH-UA-Mobile"):
+			overrides.SecCHUAMobile = value
+		case strings.EqualFold(key, "Sec-CH-UA-Platform"):
+			overrides.SecCHUAPlatform = value
+		default:
+			overrides.ExtraHeaders = append(overrides.ExtraHeaders, key, value)
+		}
+	}
+
+	return overrides
+}
+
+func (b *Browser) applyHeadlessBrowserOverrides(page *rod.Page, overrides headlessBrowserHeaderOverrides) error {
+	userAgent := strings.TrimSpace(overrides.UserAgent)
+	if userAgent == "" {
+		userAgent = b.defaultUserAgent
+	}
+	if userAgent == "" {
+		userAgent = fallbackDesktopChromeUserAgent
+	}
+
+	acceptLanguage := strings.TrimSpace(overrides.AcceptLanguage)
+	if acceptLanguage == "" {
+		acceptLanguage = defaultHeadlessAcceptLanguage
+	}
+
+	if err := page.SetUserAgent(&proto.NetworkSetUserAgentOverride{
+		UserAgent:         userAgent,
+		AcceptLanguage:    acceptLanguage,
+		Platform:          browserNavigatorPlatform(userAgent, overrides.SecCHUAPlatform),
+		UserAgentMetadata: buildDesktopChromeUserAgentMetadata(userAgent, overrides),
+	}); err != nil {
+		return err
+	}
+
+	if len(overrides.ExtraHeaders) > 0 {
+		_, err := page.SetExtraHeaders(overrides.ExtraHeaders)
+		return err
+	}
+
+	return nil
+}
+
+func normalizeHeadlessUserAgent(userAgent string) string {
+	userAgent = strings.TrimSpace(userAgent)
+	if userAgent == "" {
+		return ""
+	}
+
+	return strings.ReplaceAll(userAgent, "HeadlessChrome/", "Chrome/")
+}
+
+func buildDesktopChromeUserAgentMetadata(userAgent string, overrides headlessBrowserHeaderOverrides) *proto.EmulationUserAgentMetadata {
+	majorVersion := chromeMajorVersion(userAgent)
+	if majorVersion == "" {
+		majorVersion = "128"
+	}
+	fullVersion := chromeFullVersion(userAgent)
+	if fullVersion == "" {
+		fullVersion = majorVersion + ".0.0.0"
+	}
+	brands := parseSecCHUABrands(overrides.SecCHUA)
+	if len(brands) == 0 {
+		brands = []*proto.EmulationUserAgentBrandVersion{
+			{Brand: "Chromium", Version: majorVersion},
+			{Brand: "Not A(Brand", Version: "99"},
+		}
+	}
+	fullVersionList := make([]*proto.EmulationUserAgentBrandVersion, 0, len(brands))
+	for _, brand := range brands {
+		version := brand.Version
+		if brand.Brand != "Not A(Brand" && !strings.Contains(version, ".") {
+			version = fullVersion
+		}
+		fullVersionList = append(fullVersionList, &proto.EmulationUserAgentBrandVersion{
+			Brand:   brand.Brand,
+			Version: version,
+		})
+	}
+	platform := browserClientHintsPlatform(userAgent, overrides.SecCHUAPlatform)
+	mobile := strings.EqualFold(strings.TrimSpace(overrides.SecCHUAMobile), "?1") || strings.Contains(userAgent, " Mobile ")
+	architecture, bitness := browserArchitecture(userAgent, platform, mobile)
+
+	return &proto.EmulationUserAgentMetadata{
+		Brands:          brands,
+		FullVersionList: fullVersionList,
+		Platform:        platform,
+		PlatformVersion: browserPlatformVersion(platform),
+		Architecture:    architecture,
+		Model:           "",
+		Mobile:          mobile,
+		Bitness:         bitness,
+	}
+}
+
+func chromeMajorVersion(userAgent string) string {
+	matches := regexp.MustCompile(`Chrome/([0-9]+)`).FindStringSubmatch(userAgent)
+	if len(matches) != 2 {
+		return ""
+	}
+
+	return matches[1]
+}
+
+func chromeFullVersion(userAgent string) string {
+	matches := regexp.MustCompile(`Chrome/([0-9]+(?:\.[0-9]+){0,3})`).FindStringSubmatch(userAgent)
+	if len(matches) != 2 {
+		return ""
+	}
+
+	return matches[1]
+}
+
+func parseSecCHUABrands(secCHUA string) []*proto.EmulationUserAgentBrandVersion {
+	brands := []*proto.EmulationUserAgentBrandVersion{}
+	for _, match := range regexp.MustCompile(`"([^"]+)";v="([^"]+)"`).FindAllStringSubmatch(secCHUA, -1) {
+		if len(match) != 3 {
+			continue
+		}
+		brands = append(brands, &proto.EmulationUserAgentBrandVersion{
+			Brand:   normalizeClientHintBrand(match[1]),
+			Version: match[2],
+		})
+	}
+
+	return brands
+}
+
+func normalizeClientHintBrand(brand string) string {
+	switch brand {
+	case "Not;A=Brand", "Not_A Brand":
+		return "Not A(Brand"
+	default:
+		return brand
+	}
+}
+
+func browserNavigatorPlatform(userAgent string, secCHUAPlatform string) string {
+	switch browserClientHintsPlatform(userAgent, secCHUAPlatform) {
+	case "Windows":
+		return "Win32"
+	case "macOS":
+		return "MacIntel"
+	case "Android":
+		return "Linux armv8l"
+	default:
+		return "Linux x86_64"
+	}
+}
+
+func browserClientHintsPlatform(userAgent string, secCHUAPlatform string) string {
+	platform := strings.Trim(strings.TrimSpace(secCHUAPlatform), `"`)
+	if platform != "" {
+		switch strings.ToLower(platform) {
+		case "windows":
+			return "Windows"
+		case "macos", "mac os", "mac os x":
+			return "macOS"
+		case "android":
+			return "Android"
+		case "linux", "chrome os":
+			return platform
+		}
+		return platform
+	}
+
+	switch {
+	case strings.Contains(userAgent, "Windows NT"):
+		return "Windows"
+	case strings.Contains(userAgent, "Mac OS X"):
+		return "macOS"
+	case strings.Contains(userAgent, "Android"):
+		return "Android"
+	default:
+		return "Linux"
+	}
+}
+
+func browserPlatformVersion(platform string) string {
+	switch platform {
+	case "Windows":
+		return "10.0.0"
+	case "macOS":
+		return "14.0.0"
+	case "Android":
+		return "10.0.0"
+	default:
+		return "6.0.0"
+	}
+}
+
+func browserArchitecture(userAgent string, platform string, mobile bool) (string, string) {
+	if mobile || platform == "Android" {
+		return "", ""
+	}
+	if strings.Contains(userAgent, "arm64") || strings.Contains(userAgent, "aarch64") {
+		return "arm", "64"
+	}
+
+	return "x86", "64"
+}
+
+func buildHeadlessStealthScript(acceptLanguage string) string {
+	languages := headlessLanguages(acceptLanguage)
+	if len(languages) == 0 {
+		languages = []string{"en-US", "en"}
+	}
+
+	languagePayload, err := json.Marshal(languages)
+	if err != nil {
+		languagePayload = []byte(`["en-US","en"]`)
+	}
+
+	return fmt.Sprintf(`(() => {
+  const defineGetter = (target, key, value) => {
+    try {
+      Object.defineProperty(target, key, { get: () => value, configurable: true });
+    } catch {}
+  };
+  defineGetter(Navigator.prototype, "webdriver", undefined);
+  defineGetter(Navigator.prototype, "languages", %s);
+})();`, string(languagePayload))
+}
+
+func headlessLanguages(acceptLanguage string) []string {
+	acceptLanguage = strings.TrimSpace(acceptLanguage)
+	if acceptLanguage == "" {
+		acceptLanguage = defaultHeadlessAcceptLanguage
+	}
+
+	languages := []string{}
+	for _, part := range strings.Split(acceptLanguage, ",") {
+		language := strings.TrimSpace(strings.SplitN(part, ";", 2)[0])
+		if language == "" {
+			continue
+		}
+		languages = append(languages, language)
+	}
+
+	return languages
 }
 
 // capturePageArtifacts waits for the page and returns rendered HTML, document title, and optional screenshot bytes.
@@ -1515,7 +1802,7 @@ launchLoop:
 		}
 		request.Header.Set("Accept", "application/javascript,text/javascript,*/*;q=0.8")
 		request.Header.Set("Referer", pageOrigin+"/")
-		request.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
+		request.Header.Set("User-Agent", fallbackDesktopChromeUserAgent)
 
 		wg.Add(1)
 		go func() {
