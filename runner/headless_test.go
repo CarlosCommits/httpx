@@ -4,9 +4,11 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/go-rod/rod/lib/proto"
 	wappalyzer "github.com/projectdiscovery/wappalyzergo"
 )
 
@@ -256,6 +258,115 @@ func TestFetchSameOriginScriptBodiesUsesBoundedConcurrency(t *testing.T) {
 	}
 	if elapsed > 1400*time.Millisecond {
 		t.Fatalf("expected fallback script fetches to run concurrently, took %s", elapsed)
+	}
+}
+
+func TestParseHeadlessBrowserHeadersPreservesExtraHeaders(t *testing.T) {
+	overrides := parseHeadlessBrowserHeaders([]string{
+		"User-Agent: Mozilla/5.0 CustomChrome",
+		"Accept-Language: fr-FR,fr;q=0.9",
+		"Accept: text/html",
+		"Sec-Fetch-Site: none",
+		`Sec-Ch-Ua-Platform: "Windows"`,
+		"Sec-Ch-Ua-Mobile: ?0",
+		`Sec-Ch-Ua: "Chromium";v="128", "Not;A=Brand";v="99"`,
+	})
+
+	if overrides.UserAgent != "Mozilla/5.0 CustomChrome" {
+		t.Fatalf("expected user agent override, got %q", overrides.UserAgent)
+	}
+	if overrides.AcceptLanguage != "fr-FR,fr;q=0.9" {
+		t.Fatalf("expected accept language override, got %q", overrides.AcceptLanguage)
+	}
+	if overrides.SecCHUAPlatform != `"Windows"` {
+		t.Fatalf("expected sec-ch-ua-platform override, got %q", overrides.SecCHUAPlatform)
+	}
+	if overrides.SecCHUAMobile != "?0" {
+		t.Fatalf("expected sec-ch-ua-mobile override, got %q", overrides.SecCHUAMobile)
+	}
+	if overrides.SecCHUA != `"Chromium";v="128", "Not;A=Brand";v="99"` {
+		t.Fatalf("expected sec-ch-ua override, got %q", overrides.SecCHUA)
+	}
+
+	wantExtraHeaders := []string{"Accept", "text/html", "Sec-Fetch-Site", "none"}
+	if fmt.Sprint(overrides.ExtraHeaders) != fmt.Sprint(wantExtraHeaders) {
+		t.Fatalf("expected extra headers %v, got %v", wantExtraHeaders, overrides.ExtraHeaders)
+	}
+}
+
+func TestBuildDesktopChromeUserAgentMetadataFollowsWindowsHeaders(t *testing.T) {
+	overrides := parseHeadlessBrowserHeaders([]string{
+		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6568.0 Safari/537.36",
+		`Sec-Ch-Ua-Platform: "Windows"`,
+		"Sec-Ch-Ua-Mobile: ?0",
+		`Sec-Ch-Ua: "Chromium";v="128", "Not;A=Brand";v="99"`,
+	})
+
+	metadata := buildDesktopChromeUserAgentMetadata(overrides.UserAgent, overrides)
+
+	if got := browserNavigatorPlatform(overrides.UserAgent, overrides.SecCHUAPlatform); got != "Win32" {
+		t.Fatalf("expected Windows navigator platform, got %q", got)
+	}
+	if metadata.Platform != "Windows" {
+		t.Fatalf("expected Windows client hints platform, got %q", metadata.Platform)
+	}
+	if metadata.Architecture != "x86" || metadata.Bitness != "64" || metadata.Mobile {
+		t.Fatalf("expected desktop x64 metadata, got architecture=%q bitness=%q mobile=%t", metadata.Architecture, metadata.Bitness, metadata.Mobile)
+	}
+	if got := userAgentBrandValues(metadata.Brands); fmt.Sprint(got) != fmt.Sprint([]string{"Chromium=128", "Not A(Brand=99"}) {
+		t.Fatalf("expected sec-ch-ua brands to be preserved, got %v", metadata.Brands)
+	}
+}
+
+func userAgentBrandValues(brands []*proto.EmulationUserAgentBrandVersion) []string {
+	values := make([]string, 0, len(brands))
+	for _, brand := range brands {
+		values = append(values, brand.Brand+"="+brand.Version)
+	}
+
+	return values
+}
+
+func TestBuildDesktopChromeUserAgentMetadataDefaultsToLinuxForLinuxUA(t *testing.T) {
+	userAgent := "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6568.0 Safari/537.36"
+	metadata := buildDesktopChromeUserAgentMetadata(userAgent, headlessBrowserHeaderOverrides{})
+
+	if got := browserNavigatorPlatform(userAgent, ""); got != "Linux x86_64" {
+		t.Fatalf("expected Linux navigator platform, got %q", got)
+	}
+	if metadata.Platform != "Linux" {
+		t.Fatalf("expected Linux client hints platform, got %q", metadata.Platform)
+	}
+	if metadata.Architecture != "x86" || metadata.Bitness != "64" || metadata.Mobile {
+		t.Fatalf("expected desktop x64 metadata, got architecture=%q bitness=%q mobile=%t", metadata.Architecture, metadata.Bitness, metadata.Mobile)
+	}
+}
+
+func TestNormalizeHeadlessUserAgentRemovesHeadlessChromeMarker(t *testing.T) {
+	got := normalizeHeadlessUserAgent("Mozilla/5.0 HeadlessChrome/120.0.0.0 Safari/537.36")
+
+	if got != "Mozilla/5.0 Chrome/120.0.0.0 Safari/537.36" {
+		t.Fatalf("expected headless marker to be removed, got %q", got)
+	}
+}
+
+func TestBuildHeadlessStealthScriptUsesAcceptLanguage(t *testing.T) {
+	script := buildHeadlessStealthScript("es-ES,es;q=0.8,en;q=0.6")
+
+	for _, expected := range []string{`"webdriver"`, `"languages"`, `"es-ES"`, `"es"`, `"en"`} {
+		if !strings.Contains(script, expected) {
+			t.Fatalf("expected stealth script to contain %s: %s", expected, script)
+		}
+	}
+}
+
+func TestBuildHeadlessStealthScriptDoesNotFabricateNativePluginObjects(t *testing.T) {
+	script := buildHeadlessStealthScript(defaultHeadlessAcceptLanguage)
+
+	for _, unexpected := range []string{`"plugins"`, `"chrome"`, `"runtime"`} {
+		if strings.Contains(script, unexpected) {
+			t.Fatalf("expected stealth script not to fabricate %s: %s", unexpected, script)
+		}
 	}
 }
 
