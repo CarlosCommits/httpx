@@ -446,7 +446,7 @@ func ParseOptions() *Options {
 		flagSet.StringVar(&options.BrowserRecovery, "browser-recovery", "", "browser recovery mode for blocked pages (real-chrome)"),
 		flagSet.StringVar(&options.ChromeBin, "chrome-bin", "", "path to Chrome binary for browser recovery"),
 		flagSet.DurationVar(&options.ChromeSettleTimeout, "chrome-settle-timeout", 45*time.Second, "maximum time to let real Chrome load before collecting browser recovery evidence"),
-		flagSet.StringVar(&options.ChromeWindowSize, "chrome-window-size", "1365,768", "Chrome window size for browser recovery"),
+		flagSet.StringVar(&options.ChromeWindowSize, "chrome-window-size", defaultBrowserWindowSize, "Chrome window size for browser recovery"),
 		flagSet.StringSliceVarP(&options.HeadlessOptionalArguments, "headless-options", "ho", nil, "start headless chrome with additional options", goflags.FileCommaSeparatedStringSliceOptions),
 		flagSet.BoolVarP(&options.NoScreenshotBytes, "exclude-screenshot-bytes", "esb", false, "enable excluding screenshot bytes from json output"),
 		flagSet.BoolVarP(&options.NoHeadlessBody, "exclude-headless-body", "ehb", false, "enable excluding headless header from json output"),
@@ -891,7 +891,7 @@ func (options *Options) ValidateOptions() error {
 		options.ChromeSettleTimeout = 45 * time.Second
 	}
 	if strings.TrimSpace(options.ChromeWindowSize) == "" {
-		options.ChromeWindowSize = "1365,768"
+		options.ChromeWindowSize = defaultBrowserWindowSize
 	}
 
 	if options.Threads == 0 {
