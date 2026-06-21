@@ -350,6 +350,32 @@ func TestNormalizeHeadlessUserAgentRemovesHeadlessChromeMarker(t *testing.T) {
 	}
 }
 
+func TestBrowserViewportSizeDefaultsToSixteenTen(t *testing.T) {
+	width, height := browserViewportSizeFromOptionalArgs(nil)
+
+	if width != 1280 || height != 800 {
+		t.Fatalf("expected default browser viewport to be 1280x800, got %dx%d", width, height)
+	}
+}
+
+func TestBrowserViewportSizeFollowsWindowSizeOverride(t *testing.T) {
+	width, height := browserViewportSizeFromOptionalArgs(map[string]string{
+		"window-size": "1440,900",
+	})
+
+	if width != 1440 || height != 900 {
+		t.Fatalf("expected browser viewport to follow window-size override, got %dx%d", width, height)
+	}
+}
+
+func TestParseBrowserWindowSizeRejectsInvalidValues(t *testing.T) {
+	for _, value := range []string{"", "1280", "1280x800", "0,800", "1280,-1", "wide,tall"} {
+		if _, _, valid := parseBrowserWindowSize(value); valid {
+			t.Fatalf("expected %q to be rejected", value)
+		}
+	}
+}
+
 func TestPerformanceInitiatorResourceType(t *testing.T) {
 	tests := map[string]string{
 		"script":         "Script",
