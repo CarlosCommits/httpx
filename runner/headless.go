@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -165,6 +166,9 @@ const (
 	headlessReadinessQuietDuration = 750 * time.Millisecond
 	defaultHeadlessAcceptLanguage  = "en-US,en;q=0.9"
 	fallbackDesktopChromeUserAgent = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6568.0 Safari/537.36"
+	defaultBrowserViewportWidth    = 1280
+	defaultBrowserViewportHeight   = 800
+	defaultBrowserWindowSize       = "1280,800"
 )
 
 type HeadlessVisitOptions struct {
@@ -256,6 +260,8 @@ type Browser struct {
 	tempDir          string
 	engine           *rod.Browser
 	defaultUserAgent string
+	viewportWidth    int
+	viewportHeight   int
 	// TODO: Remove the Chrome PID kill code in favor of using Leakless(true).
 	// This change will be made if there are no complaints about zombie Chrome processes.
 	// Reference: https://github.com/projectdiscovery/httpx/pull/1426
@@ -269,6 +275,7 @@ func NewBrowser(proxy string, useLocal bool, optionalArgs map[string]string) (*B
 	}
 
 	// pids := processutil.FindProcesses(processutil.IsChromeProcess)
+	viewportWidth, viewportHeight := browserViewportSizeFromOptionalArgs(optionalArgs)
 
 	chromeLauncher := launcher.New().
 		Leakless(true).
@@ -277,10 +284,11 @@ func NewBrowser(proxy string, useLocal bool, optionalArgs map[string]string) (*B
 		Set("ignore-certificate-errors", "1").
 		Set("disable-crash-reporter", "true").
 		Set("disable-notifications", "true").
+		Set("hide-scrollbars", "true").
 		Set("disable-blink-features", "AutomationControlled").
 		Set("blink-settings", "primaryPointerType=4,availablePointerTypes=4,primaryHoverType=2,availableHoverTypes=2").
-		Set("ozone-override-screen-size", "1365,768").
-		Set("window-size", fmt.Sprintf("%d,%d", 1365, 768)).
+		Set("ozone-override-screen-size", defaultBrowserWindowSize).
+		Set("window-size", fmt.Sprintf("%d,%d", defaultBrowserViewportWidth, defaultBrowserViewportHeight)).
 		Set("mute-audio", "true").
 		Delete("enable-automation").
 		Delete("use-mock-keychain").
@@ -343,9 +351,51 @@ func NewBrowser(proxy string, useLocal bool, optionalArgs map[string]string) (*B
 		tempDir:          dataStore,
 		engine:           browser,
 		defaultUserAgent: defaultUserAgent,
+		viewportWidth:    viewportWidth,
+		viewportHeight:   viewportHeight,
 		// pids:    pids,
 	}
 	return engine, nil
+}
+
+func browserViewportSizeFromOptionalArgs(optionalArgs map[string]string) (int, int) {
+	for _, key := range []string{"window-size", "--window-size"} {
+		if value, ok := optionalArgs[key]; ok {
+			if width, height, valid := parseBrowserWindowSize(value); valid {
+				return width, height
+			}
+		}
+	}
+
+	return defaultBrowserViewportWidth, defaultBrowserViewportHeight
+}
+
+func parseBrowserWindowSize(value string) (int, int, bool) {
+	parts := strings.Split(strings.TrimSpace(value), ",")
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+
+	width, widthErr := strconv.Atoi(strings.TrimSpace(parts[0]))
+	height, heightErr := strconv.Atoi(strings.TrimSpace(parts[1]))
+	if widthErr != nil || heightErr != nil || width <= 0 || height <= 0 {
+		return 0, 0, false
+	}
+
+	return width, height, true
+}
+
+func (b *Browser) applyBrowserViewport(page *rod.Page) error {
+	if b.viewportWidth <= 0 || b.viewportHeight <= 0 {
+		return nil
+	}
+
+	return page.SetViewport(&proto.EmulationSetDeviceMetricsOverride{
+		Width:             b.viewportWidth,
+		Height:            b.viewportHeight,
+		DeviceScaleFactor: 1,
+		Mobile:            false,
+	})
 }
 
 func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (*HeadlessVisitResult, error) {
@@ -397,7 +447,12 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 		options.Idle = time.Second
 	}
 	if strings.TrimSpace(options.WindowSize) == "" {
-		options.WindowSize = "1365,768"
+		options.WindowSize = defaultBrowserWindowSize
+	}
+	viewportWidth, viewportHeight, validViewport := parseBrowserWindowSize(options.WindowSize)
+	if !validViewport {
+		viewportWidth = defaultBrowserViewportWidth
+		viewportHeight = defaultBrowserViewportHeight
 	}
 	if options.ArtifactTimeout <= 0 {
 		options.ArtifactTimeout = 10 * time.Second
@@ -457,6 +512,7 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 		"--ignore-certificate-errors",
 		"--disable-gpu",
 		"--disable-dev-shm-usage",
+		"--hide-scrollbars",
 		"--window-size=" + options.WindowSize,
 	}
 	if MustDisableSandbox() {
@@ -508,6 +564,8 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 		tempDir:          dataStore,
 		engine:           browser,
 		defaultUserAgent: fallbackDesktopChromeUserAgent,
+		viewportWidth:    viewportWidth,
+		viewportHeight:   viewportHeight,
 	}
 	if version, versionErr := browser.Version(); versionErr == nil {
 		if normalizedUserAgent := normalizeHeadlessUserAgent(version.UserAgent); normalizedUserAgent != "" {
@@ -516,6 +574,9 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 	}
 
 	networkTracker := newHeadlessNetworkTracker()
+	if err := b.applyBrowserViewport(page); err != nil {
+		return nil, err
+	}
 	if controlledNavigation {
 		if err := b.navigateExistingPageWithArtifacts(page, targetURL, waitTimeout(options.SettleTimeout), options.Headers, options.JSCodes, networkTracker); err != nil {
 			return nil, err
@@ -854,6 +915,9 @@ func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, header
 	page, err := b.engine.Page(proto.TargetCreateTarget{})
 	if err != nil {
 		return nil, nil, err
+	}
+	if err := b.applyBrowserViewport(page); err != nil {
+		return page, nil, err
 	}
 
 	networkTracker := newHeadlessNetworkTracker()
