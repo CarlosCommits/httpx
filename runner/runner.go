@@ -344,7 +344,7 @@ func New(options *Options) (*Runner, error) {
 	scanopts.MaxResponseBodySizeToSave = options.MaxResponseBodySizeToSave
 	scanopts.MaxResponseBodySizeToRead = options.MaxResponseBodySizeToRead
 	scanopts.extractRegexps = make(map[string]*regexp.Regexp)
-	if options.Screenshot || options.HeadlessTechDetect {
+	if (options.Screenshot || options.HeadlessTechDetect) && options.BrowserRecovery != BrowserRecoveryRealChrome {
 		browser, err := NewBrowser(options.HTTPProxy, options.UseInstalledChrome, options.ParseHeadlessOptionalArguments())
 		if err != nil {
 			return nil, err
@@ -356,6 +356,10 @@ func New(options *Options) (*Runner, error) {
 	scanopts.NoHeadlessBody = options.NoHeadlessBody
 	scanopts.NoScreenshotFullPage = options.NoScreenshotFullPage
 	scanopts.UseInstalledChrome = options.UseInstalledChrome
+	scanopts.BrowserRecovery = options.BrowserRecovery
+	scanopts.ChromeBin = options.ChromeBin
+	scanopts.ChromeSettleTimeout = options.ChromeSettleTimeout
+	scanopts.ChromeWindowSize = options.ChromeWindowSize
 	scanopts.ScreenshotTimeout = options.ScreenshotTimeout
 	scanopts.ScreenshotIdle = options.ScreenshotIdle
 
@@ -918,7 +922,7 @@ func (r *Runner) Close() {
 	if r.options.HostMaxErrors >= 0 {
 		r.HostErrorsCache.Purge()
 	}
-	if r.options.Screenshot || r.options.HeadlessTechDetect {
+	if (r.options.Screenshot || r.options.HeadlessTechDetect) && r.browser != nil {
 		r.browser.Close()
 	}
 	if r.options.ShowStatistics {
@@ -2545,25 +2549,49 @@ retry:
 		screenshotBytes []byte
 		headlessBody    string
 		headlessTitle   string
+		browserMode     string
 		runtimeMatches  map[string]wappalyzer.AppInfo
 		runtimeMetrics  *RuntimeTechnologyDetectionMetrics
 	)
 	var pHash uint64
 	if scanopts.Screenshot || scanopts.HeadlessTechDetect {
 		var err error
-		headlessResult, err := r.browser.VisitWithArtifacts(fullURL, HeadlessVisitOptions{
-			Timeout:                 scanopts.ScreenshotTimeout,
-			Idle:                    scanopts.ScreenshotIdle,
-			Headers:                 r.options.CustomHeaders,
-			FullPage:                scanopts.IsScreenshotFullPage(),
-			JSCodes:                 r.options.JavascriptCodes,
-			CaptureScreenshot:       scanopts.Screenshot,
-			CaptureFavicon:          scanopts.Favicon,
-			DetectRuntimeTechnology: scanopts.HeadlessTechDetect,
-			WappalyzerClient:        r.wappalyzer,
-		})
+		var headlessResult *HeadlessVisitResult
+		if scanopts.BrowserRecovery == BrowserRecoveryRealChrome {
+			browserMode = BrowserRecoveryRealChrome
+			headlessResult, err = VisitWithRealChromeRecovery(fullURL, RealChromeRecoveryOptions{
+				Timeout:                 scanopts.ChromeSettleTimeout + scanopts.ScreenshotTimeout + 10*time.Second,
+				ArtifactTimeout:         scanopts.ScreenshotTimeout,
+				Idle:                    scanopts.ScreenshotIdle,
+				Headers:                 r.options.CustomHeaders,
+				FullPage:                scanopts.IsScreenshotFullPage(),
+				JSCodes:                 r.options.JavascriptCodes,
+				CaptureScreenshot:       scanopts.Screenshot,
+				CaptureFavicon:          scanopts.Favicon,
+				DetectRuntimeTechnology: scanopts.HeadlessTechDetect,
+				WappalyzerClient:        r.wappalyzer,
+				ChromeBin:               scanopts.ChromeBin,
+				Proxy:                   r.options.Proxy,
+				SettleTimeout:           scanopts.ChromeSettleTimeout,
+				WindowSize:              scanopts.ChromeWindowSize,
+				ResponseHeaders:         resp.Headers,
+			})
+		} else {
+			browserMode = "headless"
+			headlessResult, err = r.browser.VisitWithArtifacts(fullURL, HeadlessVisitOptions{
+				Timeout:                 scanopts.ScreenshotTimeout,
+				Idle:                    scanopts.ScreenshotIdle,
+				Headers:                 r.options.CustomHeaders,
+				FullPage:                scanopts.IsScreenshotFullPage(),
+				JSCodes:                 r.options.JavascriptCodes,
+				CaptureScreenshot:       scanopts.Screenshot,
+				CaptureFavicon:          scanopts.Favicon,
+				DetectRuntimeTechnology: scanopts.HeadlessTechDetect,
+				WappalyzerClient:        r.wappalyzer,
+			})
+		}
 		if err != nil {
-			gologger.Warning().Msgf("Could not run headless probes '%s': %s", fullURL, err)
+			gologger.Warning().Msgf("Could not run browser probes '%s': %s", fullURL, err)
 		}
 		if headlessResult != nil {
 			screenshotBytes = headlessResult.ScreenshotBytes
@@ -2741,6 +2769,7 @@ retry:
 		ScreenshotBytes:   screenshotBytes,
 		HeadlessBody:      headlessBody,
 		TechDetectMetrics: runtimeMetrics,
+		BrowserMode:       browserMode,
 		KnowledgeBase:     r.classifyPage(headlessBody, respData, pHash),
 		TechnologyDetails: technologyDetails,
 		Resolvers:         resolvers,
