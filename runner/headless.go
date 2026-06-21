@@ -414,7 +414,7 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 	if err != nil {
 		return nil, errors.Wrap(err, "could not create temporary Chrome profile")
 	}
-	defer os.RemoveAll(dataStore)
+	defer func() { _ = os.RemoveAll(dataStore) }()
 
 	port, err := reserveLocalPort()
 	if err != nil {
@@ -496,7 +496,7 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 	if err := browser.Connect(); err != nil {
 		return nil, err
 	}
-	defer browser.Close()
+	defer func() { _ = browser.Close() }()
 
 	page, err := selectRealChromeRecoveryPage(browser, launchURL, waitTimeout(options.SettleTimeout))
 	if err != nil {
@@ -575,7 +575,7 @@ func resolveRealChromeBinary(chromeBin string) (string, error) {
 		if resolved, err := exec.LookPath(chromeBin); err == nil {
 			return resolved, nil
 		}
-		return "", fmt.Errorf("Chrome binary not found: %s", chromeBin)
+		return "", fmt.Errorf("chrome binary not found: %s", chromeBin)
 	}
 	for _, candidate := range []string{"google-chrome", "google-chrome-stable", "chrome", "chromium", "chromium-browser"} {
 		if resolved, err := exec.LookPath(candidate); err == nil {
@@ -606,7 +606,7 @@ func reserveLocalPort() (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer listener.Close()
+	defer func() { _ = listener.Close() }()
 	addr, ok := listener.Addr().(*net.TCPAddr)
 	if !ok {
 		return 0, errors.New("could not reserve a TCP port")
@@ -634,7 +634,7 @@ func waitForChromeDebugging(controlURL string, timeout time.Duration) (string, e
 		time.Sleep(250 * time.Millisecond)
 	}
 
-	return "", fmt.Errorf("Chrome debugging endpoint did not become ready before timeout: %s", controlURL)
+	return "", fmt.Errorf("chrome debugging endpoint did not become ready before timeout: %s", controlURL)
 }
 
 func selectRealChromeRecoveryPage(browser *rod.Browser, targetURL string, timeout time.Duration) (*rod.Page, error) {
