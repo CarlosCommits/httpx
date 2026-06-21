@@ -6,9 +6,12 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -192,6 +195,24 @@ type HeadlessVisitResult struct {
 	RuntimeMetrics  *RuntimeTechnologyDetectionMetrics
 }
 
+type RealChromeRecoveryOptions struct {
+	Timeout                 time.Duration
+	ArtifactTimeout         time.Duration
+	Idle                    time.Duration
+	Headers                 []string
+	FullPage                bool
+	JSCodes                 []string
+	CaptureScreenshot       bool
+	CaptureFavicon          bool
+	DetectRuntimeTechnology bool
+	WappalyzerClient        *wappalyzer.Wappalyze
+	ChromeBin               string
+	Proxy                   string
+	SettleTimeout           time.Duration
+	WindowSize              string
+	ResponseHeaders         map[string][]string
+}
+
 type runtimeBodyCollection struct {
 	Bodies       []string
 	CapturedURLs map[string]struct{}
@@ -306,7 +327,7 @@ func NewBrowser(proxy string, useLocal bool, optionalArgs map[string]string) (*B
 		return nil, err
 	}
 
-	browser := rod.New().ControlURL(launcherURL)
+	browser := rod.New().ControlURL(launcherURL).NoDefaultDevice()
 	if browserErr := browser.Connect(); browserErr != nil {
 		return nil, browserErr
 	}
@@ -368,19 +389,401 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 	return result, err
 }
 
-// setupPageAndNavigate opens a page, performs all adaptive actions including JS injection
-func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, headers []string, jsCodes []string) (*rod.Page, *headlessNetworkTracker, error) {
-	page, err := b.engine.Page(proto.TargetCreateTarget{})
-	if err != nil {
-		return nil, nil, err
+func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOptions) (*HeadlessVisitResult, error) {
+	if options.SettleTimeout <= 0 {
+		options.SettleTimeout = 45 * time.Second
+	}
+	if options.Idle <= 0 {
+		options.Idle = time.Second
+	}
+	if strings.TrimSpace(options.WindowSize) == "" {
+		options.WindowSize = "1365,768"
+	}
+	if options.ArtifactTimeout <= 0 {
+		options.ArtifactTimeout = 10 * time.Second
+	}
+	if options.Timeout <= 0 {
+		options.Timeout = options.SettleTimeout + options.ArtifactTimeout + 10*time.Second
 	}
 
-	// Enable network
-	page.EnableDomain(proto.NetworkEnable{})
+	chromeBin, err := resolveRealChromeBinary(options.ChromeBin)
+	if err != nil {
+		return nil, err
+	}
+	dataStore, err := os.MkdirTemp("", "httpx-real-chrome-*")
+	if err != nil {
+		return nil, errors.Wrap(err, "could not create temporary Chrome profile")
+	}
+	defer os.RemoveAll(dataStore)
+
+	port, err := reserveLocalPort()
+	if err != nil {
+		return nil, err
+	}
+	proxy := resolveChromeProxy(options.Proxy)
+
+	ctx, cancel := context.WithTimeout(context.Background(), options.Timeout)
+	defer cancel()
+	remainingTimeout := func() time.Duration {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			return options.Timeout
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return time.Nanosecond
+		}
+		return remaining
+	}
+	waitTimeout := func(max time.Duration) time.Duration {
+		remaining := remainingTimeout()
+		if max <= 0 || remaining < max {
+			return remaining
+		}
+		return max
+	}
+
+	controlledNavigation := len(options.Headers) > 0 || len(options.JSCodes) > 0
+	launchURL := targetURL
+	if controlledNavigation {
+		launchURL = "about:blank"
+	}
+	args := []string{
+		"--remote-debugging-address=127.0.0.1",
+		fmt.Sprintf("--remote-debugging-port=%d", port),
+		"--user-data-dir=" + dataStore,
+		"--no-first-run",
+		"--no-default-browser-check",
+		"--ignore-certificate-errors",
+		"--disable-gpu",
+		"--disable-dev-shm-usage",
+		"--window-size=" + options.WindowSize,
+	}
+	if MustDisableSandbox() {
+		args = append(args, "--no-sandbox")
+	}
+	if proxy != "" {
+		args = append(args, "--proxy-server="+proxy)
+	}
+	args = append(args, launchURL)
+
+	cmd := exec.CommandContext(ctx, chromeBin, args...)
+	if err := cmd.Start(); err != nil {
+		return nil, errors.Wrap(err, "could not launch Chrome")
+	}
+	defer func() {
+		cancel()
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+		_ = cmd.Wait()
+	}()
+
+	controlURL := fmt.Sprintf("http://127.0.0.1:%d", port)
+	websocketURL, err := waitForChromeDebugging(controlURL, waitTimeout(10*time.Second))
+	if err != nil {
+		return nil, err
+	}
+	if !controlledNavigation {
+		select {
+		case <-time.After(waitTimeout(options.SettleTimeout)):
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+
+	browser := rod.New().ControlURL(websocketURL).NoDefaultDevice()
+	if err := browser.Connect(); err != nil {
+		return nil, err
+	}
+	defer browser.Close()
+
+	page, err := selectRealChromeRecoveryPage(browser, launchURL, waitTimeout(options.SettleTimeout))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = page.Close() }()
+
+	b := &Browser{
+		tempDir:          dataStore,
+		engine:           browser,
+		defaultUserAgent: fallbackDesktopChromeUserAgent,
+	}
+	if version, versionErr := browser.Version(); versionErr == nil {
+		if normalizedUserAgent := normalizeHeadlessUserAgent(version.UserAgent); normalizedUserAgent != "" {
+			b.defaultUserAgent = normalizedUserAgent
+		}
+	}
 
 	networkTracker := newHeadlessNetworkTracker()
+	if controlledNavigation {
+		if err := b.navigateExistingPageWithArtifacts(page, targetURL, waitTimeout(options.SettleTimeout), options.Headers, options.JSCodes, networkTracker); err != nil {
+			return nil, err
+		}
+	} else {
+		seedRealChromeDocumentRequest(networkTracker, page, normalizeHTTPResponseHeaders(options.ResponseHeaders))
+		seedPerformanceResourceRequests(networkTracker, page)
+	}
+	page = page.Timeout(waitTimeout(options.ArtifactTimeout))
+	screenshot, body, title, networkRequests, artifactErr := b.capturePageArtifacts(
+		page,
+		networkTracker,
+		options.Idle,
+		options.FullPage,
+		options.CaptureScreenshot,
+		options.DetectRuntimeTechnology,
+	)
+	if artifactErr != nil && !options.DetectRuntimeTechnology {
+		return nil, artifactErr
+	}
+	if artifactErr != nil {
+		networkRequests = networkTracker.snapshot()
+		if title == "" {
+			title = b.captureDocumentTitle(page)
+		}
+	}
 
-	// Intercept outbound requests
+	result := &HeadlessVisitResult{
+		ScreenshotBytes: screenshot,
+		Body:            body,
+		Title:           title,
+		NetworkRequests: networkRequests,
+		RuntimeMatches:  map[string]wappalyzer.AppInfo{},
+	}
+	if options.CaptureFavicon {
+		result.Favicons = b.collectHeadlessFavicons(page, body, networkRequests)
+	}
+	if options.DetectRuntimeTechnology {
+		result.RuntimeMatches, result.RuntimeMetrics = b.detectRuntimeTechnologies(page, networkRequests, body, options.WappalyzerClient)
+		if artifactErr != nil && result.RuntimeMetrics != nil {
+			result.RuntimeMetrics.Partial = true
+			if result.RuntimeMetrics.StopReason == "" || result.RuntimeMetrics.StopReason == "completed" {
+				result.RuntimeMetrics.StopReason = "artifact_capture_failed"
+			}
+		}
+	}
+
+	return result, artifactErr
+}
+
+func resolveRealChromeBinary(chromeBin string) (string, error) {
+	chromeBin = strings.TrimSpace(chromeBin)
+	if chromeBin != "" {
+		if filepath.IsAbs(chromeBin) {
+			return chromeBin, nil
+		}
+		if resolved, err := exec.LookPath(chromeBin); err == nil {
+			return resolved, nil
+		}
+		return "", fmt.Errorf("Chrome binary not found: %s", chromeBin)
+	}
+	for _, candidate := range []string{"google-chrome", "google-chrome-stable", "chrome", "chromium", "chromium-browser"} {
+		if resolved, err := exec.LookPath(candidate); err == nil {
+			return resolved, nil
+		}
+	}
+	if chromePath, hasChrome := launcher.LookPath(); hasChrome {
+		return chromePath, nil
+	}
+	return "", errors.New("the chrome browser is not installed")
+}
+
+func resolveChromeProxy(proxy string) string {
+	proxy = strings.TrimSpace(proxy)
+	if proxy != "" {
+		return proxy
+	}
+	for _, key := range []string{"HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy"} {
+		if value := strings.TrimSpace(os.Getenv(key)); value != "" {
+			return value
+		}
+	}
+	return ""
+}
+
+func reserveLocalPort() (int, error) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return 0, err
+	}
+	defer listener.Close()
+	addr, ok := listener.Addr().(*net.TCPAddr)
+	if !ok {
+		return 0, errors.New("could not reserve a TCP port")
+	}
+	return addr.Port, nil
+}
+
+func waitForChromeDebugging(controlURL string, timeout time.Duration) (string, error) {
+	deadline := time.Now().Add(timeout)
+	client := &http.Client{Timeout: 500 * time.Millisecond}
+	versionURL := strings.TrimRight(controlURL, "/") + "/json/version"
+
+	for time.Now().Before(deadline) {
+		response, err := client.Get(versionURL)
+		if err == nil {
+			var payload struct {
+				WebSocketDebuggerURL string `json:"webSocketDebuggerUrl"`
+			}
+			decodeErr := json.NewDecoder(response.Body).Decode(&payload)
+			_ = response.Body.Close()
+			if response.StatusCode == http.StatusOK && decodeErr == nil && payload.WebSocketDebuggerURL != "" {
+				return payload.WebSocketDebuggerURL, nil
+			}
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+
+	return "", fmt.Errorf("Chrome debugging endpoint did not become ready before timeout: %s", controlURL)
+}
+
+func selectRealChromeRecoveryPage(browser *rod.Browser, targetURL string, timeout time.Duration) (*rod.Page, error) {
+	deadline := time.Now().Add(timeout)
+	targetHost := ""
+	if parsed, err := url.Parse(targetURL); err == nil {
+		targetHost = parsed.Hostname()
+	}
+
+	for time.Now().Before(deadline) {
+		pages, err := browser.Pages()
+		if err == nil {
+			var fallback *rod.Page
+			for _, page := range pages {
+				info, infoErr := page.Info()
+				if infoErr != nil || info == nil {
+					continue
+				}
+				pageURL := strings.TrimSpace(info.URL)
+				if pageURL == "" || strings.HasPrefix(pageURL, "devtools://") || strings.HasPrefix(pageURL, "chrome://") {
+					continue
+				}
+				if fallback == nil {
+					fallback = page
+				}
+				if targetHost != "" {
+					if parsed, parseErr := url.Parse(pageURL); parseErr == nil && sameOrSubdomain(parsed.Hostname(), targetHost) {
+						return page, nil
+					}
+				}
+			}
+			if fallback != nil {
+				return fallback, nil
+			}
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
+
+	return nil, errors.New("could not find a Chrome page target for browser recovery")
+}
+
+func seedRealChromeDocumentRequest(networkTracker *headlessNetworkTracker, page *rod.Page, responseHeaders map[string]string) {
+	info, err := page.Info()
+	if err != nil || info == nil {
+		return
+	}
+	pageURL := strings.TrimSpace(info.URL)
+	if pageURL == "" || !stringsutil.HasPrefixAnyI(pageURL, "http://", "https://") {
+		return
+	}
+	networkTracker.start(NetworkRequest{
+		RequestID:       "real-chrome-document",
+		URL:             pageURL,
+		Method:          http.MethodGet,
+		ResourceType:    "Document",
+		StatusCode:      http.StatusOK,
+		ResponseHeaders: responseHeaders,
+	})
+	networkTracker.finish("real-chrome-document")
+}
+
+func normalizeHTTPResponseHeaders(headers map[string][]string) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	normalized := make(map[string]string, len(headers))
+	for name, values := range headers {
+		headerName := strings.ToLower(strings.TrimSpace(name))
+		if headerName == "" || len(values) == 0 {
+			continue
+		}
+		normalized[headerName] = strings.ToLower(strings.TrimSpace(strings.Join(values, ",")))
+	}
+	if len(normalized) == 0 {
+		return nil
+	}
+	return normalized
+}
+
+func seedPerformanceResourceRequests(networkTracker *headlessNetworkTracker, page *rod.Page) {
+	output, err := page.Eval(`() => JSON.stringify(performance.getEntriesByType("resource").map((entry) => ({
+		name: entry.name || "",
+		initiatorType: entry.initiatorType || ""
+	})).filter((entry) => /^https?:\/\//i.test(entry.name)).slice(0, 250))`)
+	if err != nil {
+		return
+	}
+
+	rawValue := fmt.Sprint(output.Value)
+	var serialized string
+	if err := json.Unmarshal([]byte(rawValue), &serialized); err != nil {
+		return
+	}
+
+	var entries []struct {
+		Name          string `json:"name"`
+		InitiatorType string `json:"initiatorType"`
+	}
+	if err := json.Unmarshal([]byte(serialized), &entries); err != nil {
+		return
+	}
+
+	for index, entry := range entries {
+		rawURL := strings.TrimSpace(entry.Name)
+		if rawURL == "" {
+			continue
+		}
+		requestID := fmt.Sprintf("performance-resource-%d", index)
+		networkTracker.start(NetworkRequest{
+			RequestID:    requestID,
+			URL:          rawURL,
+			Method:       http.MethodGet,
+			ResourceType: performanceInitiatorResourceType(entry.InitiatorType),
+			StatusCode:   http.StatusOK,
+			ErrorType:    "",
+		})
+		networkTracker.finish(requestID)
+	}
+}
+
+func performanceInitiatorResourceType(initiatorType string) string {
+	switch strings.ToLower(strings.TrimSpace(initiatorType)) {
+	case "script":
+		return "Script"
+	case "css", "link":
+		return "Stylesheet"
+	case "img", "image":
+		return "Image"
+	case "xmlhttprequest", "fetch":
+		return "XHR"
+	case "iframe", "frame":
+		return "Document"
+	default:
+		if strings.TrimSpace(initiatorType) != "" {
+			return strings.TrimSpace(initiatorType)
+		}
+		return "Other"
+	}
+}
+
+func sameOrSubdomain(hostname, parent string) bool {
+	hostname = strings.ToLower(strings.TrimSuffix(hostname, "."))
+	parent = strings.ToLower(strings.TrimSuffix(parent, "."))
+	return hostname == parent || strings.HasSuffix(hostname, "."+parent)
+}
+
+func attachNetworkTracker(page *rod.Page, networkTracker *headlessNetworkTracker) error {
+	page.EnableDomain(proto.NetworkEnable{})
 	go page.EachEvent(func(e *proto.NetworkRequestWillBeSent) {
 		if !stringsutil.HasPrefixAnyI(e.Request.URL, "http://", "https://") {
 			return
@@ -394,49 +797,69 @@ func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, header
 			ErrorType:    "QUIT_BEFORE_RESOURCE_LOADING_END",
 		})
 	})()
-	// Intercept inbound responses
 	go page.EachEvent(func(e *proto.NetworkResponseReceived) {
 		networkTracker.response(string(e.RequestID), e.Response.Status, string(e.Type), e.Response.Headers)
 	})()
-	// Intercept network end requests
 	go page.EachEvent(func(e *proto.NetworkLoadingFinished) {
 		networkTracker.finish(string(e.RequestID))
 	})()
-	// Intercept failed request
 	go page.EachEvent(func(e *proto.NetworkLoadingFailed) {
 		networkTracker.fail(string(e.RequestID), getSimpleErrorType(e.ErrorText, string(e.Type), string(e.BlockedReason)))
 	})()
+	return nil
+}
 
-	// Handle any popup dialogs
+func attachDialogAutoAccept(page *rod.Page) {
 	go page.EachEvent(func(e *proto.PageJavascriptDialogOpening) {
 		_ = proto.PageHandleJavaScriptDialog{
 			Accept:     true,
 			PromptText: "",
 		}.Call(page)
 	})()
+}
+
+func (b *Browser) navigateExistingPageWithArtifacts(page *rod.Page, url string, timeout time.Duration, headers []string, jsCodes []string, networkTracker *headlessNetworkTracker) error {
+	if err := attachNetworkTracker(page, networkTracker); err != nil {
+		return err
+	}
+	attachDialogAutoAccept(page)
 
 	headerOverrides := parseHeadlessBrowserHeaders(headers)
 	if err := b.applyHeadlessBrowserOverrides(page, headerOverrides); err != nil {
-		return page, networkTracker, err
+		return err
 	}
 	if _, err := page.EvalOnNewDocument(buildHeadlessStealthScript(headerOverrides.AcceptLanguage)); err != nil {
-		return page, networkTracker, err
+		return err
 	}
 
 	page = page.Timeout(timeout)
 
 	if err := page.Navigate(url); err != nil {
-		return page, networkTracker, err
+		return err
 	}
 
 	if len(jsCodes) > 0 {
 		_, err := b.ExecuteJavascriptCodesWithPage(page, jsCodes)
 		if err != nil {
-			return page, networkTracker, err
+			return err
 		}
 	}
 
 	page.Timeout(5 * time.Second).WaitNavigation(proto.PageLifecycleEventNameFirstMeaningfulPaint)()
+	return nil
+}
+
+// setupPageAndNavigate opens a page, performs all adaptive actions including JS injection
+func (b *Browser) setupPageAndNavigate(url string, timeout time.Duration, headers []string, jsCodes []string) (*rod.Page, *headlessNetworkTracker, error) {
+	page, err := b.engine.Page(proto.TargetCreateTarget{})
+	if err != nil {
+		return nil, nil, err
+	}
+
+	networkTracker := newHeadlessNetworkTracker()
+	if err := b.navigateExistingPageWithArtifacts(page, url, timeout, headers, jsCodes, networkTracker); err != nil {
+		return page, networkTracker, err
+	}
 
 	return page, networkTracker, nil
 }

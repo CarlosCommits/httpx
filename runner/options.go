@@ -43,6 +43,8 @@ const (
 	DefaultOutputDirectory = "output"
 )
 
+const BrowserRecoveryRealChrome = "real-chrome"
+
 var (
 	PDCPApiKey = ""
 	TeamIDEnv  = env.GetEnvOrDefault("PDCP_TEAM_ID", "")
@@ -105,6 +107,10 @@ type ScanOptions struct {
 	Hashes                    string
 	Screenshot                bool
 	UseInstalledChrome        bool
+	BrowserRecovery           string
+	ChromeBin                 string
+	ChromeSettleTimeout       time.Duration
+	ChromeWindowSize          string
 	DisableStdin              bool
 	NoScreenshotBytes         bool
 	NoHeadlessBody            bool
@@ -168,6 +174,10 @@ func (s *ScanOptions) Clone() *ScanOptions {
 		Hashes:                    s.Hashes,
 		Screenshot:                s.Screenshot,
 		UseInstalledChrome:        s.UseInstalledChrome,
+		BrowserRecovery:           s.BrowserRecovery,
+		ChromeBin:                 s.ChromeBin,
+		ChromeSettleTimeout:       s.ChromeSettleTimeout,
+		ChromeWindowSize:          s.ChromeWindowSize,
 		NoScreenshotBytes:         s.NoScreenshotBytes,
 		NoHeadlessBody:            s.NoHeadlessBody,
 		NoScreenshotFullPage:      s.NoScreenshotFullPage,
@@ -334,6 +344,10 @@ type Options struct {
 	NoDecode             bool
 	Screenshot           bool
 	UseInstalledChrome   bool
+	BrowserRecovery      string
+	ChromeBin            string
+	ChromeSettleTimeout  time.Duration
+	ChromeWindowSize     string
 	TlsImpersonate       bool
 	DisableStdin         bool
 	HttpApiEndpoint      string
@@ -346,7 +360,7 @@ type Options struct {
 	HeadlessOptionalArguments goflags.StringSlice
 	Protocol                  string
 	OutputFilterErrorPagePath string
-	DisableStdout bool
+	DisableStdout             bool
 
 	JavascriptCodes goflags.StringSlice
 
@@ -429,6 +443,10 @@ func ParseOptions() *Options {
 	flagSet.CreateGroup("headless", "Headless",
 		flagSet.BoolVarP(&options.Screenshot, "screenshot", "ss", false, "enable saving screenshot of the page using headless browser"),
 		flagSet.BoolVar(&options.UseInstalledChrome, "system-chrome", false, "enable using local installed chrome for screenshot"),
+		flagSet.StringVar(&options.BrowserRecovery, "browser-recovery", "", "browser recovery mode for blocked pages (real-chrome)"),
+		flagSet.StringVar(&options.ChromeBin, "chrome-bin", "", "path to Chrome binary for browser recovery"),
+		flagSet.DurationVar(&options.ChromeSettleTimeout, "chrome-settle-timeout", 45*time.Second, "maximum time to let real Chrome load before collecting browser recovery evidence"),
+		flagSet.StringVar(&options.ChromeWindowSize, "chrome-window-size", "1365,768", "Chrome window size for browser recovery"),
 		flagSet.StringSliceVarP(&options.HeadlessOptionalArguments, "headless-options", "ho", nil, "start headless chrome with additional options", goflags.FileCommaSeparatedStringSliceOptions),
 		flagSet.BoolVarP(&options.NoScreenshotBytes, "exclude-screenshot-bytes", "esb", false, "enable excluding screenshot bytes from json output"),
 		flagSet.BoolVarP(&options.NoHeadlessBody, "exclude-headless-body", "ehb", false, "enable excluding headless header from json output"),
@@ -864,6 +882,16 @@ func (options *Options) ValidateOptions() error {
 
 	if !stringsutil.EqualFoldAny(options.Protocol, string(httpxcommon.UNKNOWN), string(httpxcommon.HTTP11)) {
 		return fmt.Errorf("invalid protocol: %s", options.Protocol)
+	}
+	options.BrowserRecovery = strings.ToLower(strings.TrimSpace(options.BrowserRecovery))
+	if options.BrowserRecovery != "" && !stringsutil.EqualFoldAny(options.BrowserRecovery, BrowserRecoveryRealChrome) {
+		return fmt.Errorf("invalid browser recovery mode: %s", options.BrowserRecovery)
+	}
+	if options.ChromeSettleTimeout <= 0 {
+		options.ChromeSettleTimeout = 45 * time.Second
+	}
+	if strings.TrimSpace(options.ChromeWindowSize) == "" {
+		options.ChromeWindowSize = "1365,768"
 	}
 
 	if options.Threads == 0 {

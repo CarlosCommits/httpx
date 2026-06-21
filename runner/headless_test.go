@@ -350,6 +350,56 @@ func TestNormalizeHeadlessUserAgentRemovesHeadlessChromeMarker(t *testing.T) {
 	}
 }
 
+func TestPerformanceInitiatorResourceType(t *testing.T) {
+	tests := map[string]string{
+		"script":         "Script",
+		"css":            "Stylesheet",
+		"link":           "Stylesheet",
+		"img":            "Image",
+		"xmlhttprequest": "XHR",
+		"fetch":          "XHR",
+		"iframe":         "Document",
+		"":               "Other",
+	}
+
+	for input, expected := range tests {
+		if got := performanceInitiatorResourceType(input); got != expected {
+			t.Fatalf("performanceInitiatorResourceType(%q) = %q, want %q", input, got, expected)
+		}
+	}
+}
+
+func TestNormalizeHTTPResponseHeaders(t *testing.T) {
+	headers := normalizeHTTPResponseHeaders(map[string][]string{
+		"X-Powered-By":  {"Express"},
+		"Cache-Control": {"no-cache", "no-store"},
+	})
+
+	if headers["x-powered-by"] != "express" {
+		t.Fatalf("expected x-powered-by to be normalized, got %#v", headers)
+	}
+	if headers["cache-control"] != "no-cache,no-store" {
+		t.Fatalf("expected multi-value header to be joined, got %#v", headers)
+	}
+}
+
+func TestResolveChromeProxyUsesExplicitProxy(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://env-proxy:8080")
+
+	if got := resolveChromeProxy("socks5://127.0.0.1:9050"); got != "socks5://127.0.0.1:9050" {
+		t.Fatalf("expected explicit proxy to win, got %q", got)
+	}
+}
+
+func TestResolveChromeProxyFallsBackToEnvironment(t *testing.T) {
+	t.Setenv("HTTPS_PROXY", "http://env-proxy:8080")
+	t.Setenv("HTTP_PROXY", "http://lower-priority:8080")
+
+	if got := resolveChromeProxy(""); got != "http://env-proxy:8080" {
+		t.Fatalf("expected environment proxy fallback, got %q", got)
+	}
+}
+
 func TestBuildHeadlessStealthScriptUsesAcceptLanguage(t *testing.T) {
 	script := buildHeadlessStealthScript("es-ES,es;q=0.8,en;q=0.6")
 
