@@ -898,6 +898,10 @@ func (options *Options) ValidateOptions() error {
 		gologger.Info().Msgf("Threads automatically set to %d", defaultThreads)
 		options.Threads = defaultThreads
 	}
+	if options.BrowserRecovery == BrowserRecoveryRealChrome && (options.Screenshot || options.HeadlessTechDetect) && options.Threads > 1 {
+		gologger.Warning().Msgf("Real Chrome browser recovery starts a full Chrome process per target; threads reduced from %d to 1", options.Threads)
+		options.Threads = 1
+	}
 
 	return nil
 }

@@ -529,13 +529,36 @@ func TestStoreResponse_withoutMatchersStoresAll(t *testing.T) {
 func TestStoreResponse_withMatcherSetsFlag(t *testing.T) {
 	dir := t.TempDir()
 	opts := &Options{
-		StoreResponse:       true,
-		StoreResponseDir:    dir,
+		StoreResponse:         true,
+		StoreResponseDir:      dir,
 		OutputMatchStatusCode: "200",
 	}
 	err := opts.ValidateOptions()
 	require.Nil(t, err)
 	require.True(t, opts.HasMatcherOrFilter())
+}
+
+func TestValidateOptionsRealChromeRecoveryForcesSingleThread(t *testing.T) {
+	opts := &Options{
+		BrowserRecovery:    BrowserRecoveryRealChrome,
+		HeadlessTechDetect: true,
+		Threads:            50,
+	}
+
+	err := opts.ValidateOptions()
+	require.Nil(t, err)
+	require.Equal(t, 1, opts.Threads)
+}
+
+func TestValidateOptionsRealChromeRecoveryDoesNotSerializeNonBrowserScans(t *testing.T) {
+	opts := &Options{
+		BrowserRecovery: BrowserRecoveryRealChrome,
+		Threads:         50,
+	}
+
+	err := opts.ValidateOptions()
+	require.Nil(t, err)
+	require.Equal(t, 50, opts.Threads)
 }
 
 func TestRunner_duplicate(t *testing.T) {
