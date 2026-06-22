@@ -401,18 +401,24 @@ func (b *Browser) applyBrowserViewport(page *rod.Page) error {
 func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (*HeadlessVisitResult, error) {
 	page, networkTracker, err := b.setupPageAndNavigate(url, options.Timeout, options.Headers, options.JSCodes)
 	if err != nil {
+		if page != nil {
+			b.closePage(page)
+		}
 		return nil, err
 	}
 	defer b.closePage(page)
 
-	screenshot, body, title, networkRequests, err := b.capturePageArtifacts(page, networkTracker, options.Idle, options.FullPage, options.CaptureScreenshot, options.DetectRuntimeTechnology)
+	artifactPage := page.Timeout(options.Timeout)
+	defer artifactPage.CancelTimeout()
+
+	screenshot, body, title, networkRequests, err := b.capturePageArtifacts(artifactPage, networkTracker, options.Idle, options.FullPage, options.CaptureScreenshot, options.DetectRuntimeTechnology)
 	if err != nil && !options.DetectRuntimeTechnology {
 		return nil, err
 	}
 	if err != nil {
 		networkRequests = networkTracker.snapshot()
 		if title == "" {
-			title = b.captureDocumentTitle(page)
+			title = b.captureDocumentTitle(artifactPage)
 		}
 	}
 
@@ -424,10 +430,10 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 		RuntimeMatches:  map[string]wappalyzer.AppInfo{},
 	}
 	if options.CaptureFavicon {
-		result.Favicons = b.collectHeadlessFavicons(page, body, networkRequests)
+		result.Favicons = b.collectHeadlessFavicons(artifactPage, body, networkRequests)
 	}
 	if options.DetectRuntimeTechnology {
-		result.RuntimeMatches, result.RuntimeMetrics = b.detectRuntimeTechnologies(page, networkRequests, body, options.WappalyzerClient)
+		result.RuntimeMatches, result.RuntimeMetrics = b.detectRuntimeTechnologies(artifactPage, networkRequests, body, options.WappalyzerClient)
 		if err != nil && result.RuntimeMetrics != nil {
 			result.RuntimeMetrics.Partial = true
 			if result.RuntimeMetrics.StopReason == "" || result.RuntimeMetrics.StopReason == "completed" {
@@ -558,7 +564,6 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 	if err != nil {
 		return nil, err
 	}
-	defer func() { _ = page.Close() }()
 
 	b := &Browser{
 		tempDir:          dataStore,
@@ -567,6 +572,7 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 		viewportWidth:    viewportWidth,
 		viewportHeight:   viewportHeight,
 	}
+	defer b.closePage(page)
 	if version, versionErr := browser.Version(); versionErr == nil {
 		if normalizedUserAgent := normalizeHeadlessUserAgent(version.UserAgent); normalizedUserAgent != "" {
 			b.defaultUserAgent = normalizedUserAgent
@@ -585,9 +591,10 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 		seedRealChromeDocumentRequest(networkTracker, page, normalizeHTTPResponseHeaders(options.ResponseHeaders))
 		seedPerformanceResourceRequests(networkTracker, page)
 	}
-	page = page.Timeout(waitTimeout(options.ArtifactTimeout))
+	artifactPage := page.Timeout(waitTimeout(options.ArtifactTimeout))
+	defer artifactPage.CancelTimeout()
 	screenshot, body, title, networkRequests, artifactErr := b.capturePageArtifacts(
-		page,
+		artifactPage,
 		networkTracker,
 		options.Idle,
 		options.FullPage,
@@ -600,7 +607,7 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 	if artifactErr != nil {
 		networkRequests = networkTracker.snapshot()
 		if title == "" {
-			title = b.captureDocumentTitle(page)
+			title = b.captureDocumentTitle(artifactPage)
 		}
 	}
 
@@ -612,10 +619,10 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 		RuntimeMatches:  map[string]wappalyzer.AppInfo{},
 	}
 	if options.CaptureFavicon {
-		result.Favicons = b.collectHeadlessFavicons(page, body, networkRequests)
+		result.Favicons = b.collectHeadlessFavicons(artifactPage, body, networkRequests)
 	}
 	if options.DetectRuntimeTechnology {
-		result.RuntimeMatches, result.RuntimeMetrics = b.detectRuntimeTechnologies(page, networkRequests, body, options.WappalyzerClient)
+		result.RuntimeMatches, result.RuntimeMetrics = b.detectRuntimeTechnologies(artifactPage, networkRequests, body, options.WappalyzerClient)
 		if artifactErr != nil && result.RuntimeMetrics != nil {
 			result.RuntimeMetrics.Partial = true
 			if result.RuntimeMetrics.StopReason == "" || result.RuntimeMetrics.StopReason == "completed" {
@@ -843,9 +850,9 @@ func sameOrSubdomain(hostname, parent string) bool {
 	return hostname == parent || strings.HasSuffix(hostname, "."+parent)
 }
 
-func attachNetworkTracker(page *rod.Page, networkTracker *headlessNetworkTracker) error {
-	page.EnableDomain(proto.NetworkEnable{})
-	go page.EachEvent(func(e *proto.NetworkRequestWillBeSent) {
+func attachNetworkTracker(commandPage *rod.Page, eventPage *rod.Page, networkTracker *headlessNetworkTracker) error {
+	commandPage.EnableDomain(proto.NetworkEnable{})
+	go eventPage.EachEvent(func(e *proto.NetworkRequestWillBeSent) {
 		if !stringsutil.HasPrefixAnyI(e.Request.URL, "http://", "https://") {
 			return
 		}
@@ -858,13 +865,13 @@ func attachNetworkTracker(page *rod.Page, networkTracker *headlessNetworkTracker
 			ErrorType:    "QUIT_BEFORE_RESOURCE_LOADING_END",
 		})
 	})()
-	go page.EachEvent(func(e *proto.NetworkResponseReceived) {
+	go eventPage.EachEvent(func(e *proto.NetworkResponseReceived) {
 		networkTracker.response(string(e.RequestID), e.Response.Status, string(e.Type), e.Response.Headers)
 	})()
-	go page.EachEvent(func(e *proto.NetworkLoadingFinished) {
+	go eventPage.EachEvent(func(e *proto.NetworkLoadingFinished) {
 		networkTracker.finish(string(e.RequestID))
 	})()
-	go page.EachEvent(func(e *proto.NetworkLoadingFailed) {
+	go eventPage.EachEvent(func(e *proto.NetworkLoadingFailed) {
 		networkTracker.fail(string(e.RequestID), getSimpleErrorType(e.ErrorText, string(e.Type), string(e.BlockedReason)))
 	})()
 	return nil
@@ -880,33 +887,36 @@ func attachDialogAutoAccept(page *rod.Page) {
 }
 
 func (b *Browser) navigateExistingPageWithArtifacts(page *rod.Page, url string, timeout time.Duration, headers []string, jsCodes []string, networkTracker *headlessNetworkTracker) error {
-	if err := attachNetworkTracker(page, networkTracker); err != nil {
+	operationPage := page.Timeout(timeout)
+	defer operationPage.CancelTimeout()
+
+	if err := attachNetworkTracker(operationPage, page, networkTracker); err != nil {
 		return err
 	}
 	attachDialogAutoAccept(page)
 
 	headerOverrides := parseHeadlessBrowserHeaders(headers)
-	if err := b.applyHeadlessBrowserOverrides(page, headerOverrides); err != nil {
+	if err := b.applyHeadlessBrowserOverrides(operationPage, headerOverrides); err != nil {
 		return err
 	}
-	if _, err := page.EvalOnNewDocument(buildHeadlessStealthScript(headerOverrides.AcceptLanguage)); err != nil {
+	if _, err := operationPage.EvalOnNewDocument(buildHeadlessStealthScript(headerOverrides.AcceptLanguage)); err != nil {
 		return err
 	}
 
-	page = page.Timeout(timeout)
-
-	if err := page.Navigate(url); err != nil {
+	if err := operationPage.Navigate(url); err != nil {
 		return err
 	}
 
 	if len(jsCodes) > 0 {
-		_, err := b.ExecuteJavascriptCodesWithPage(page, jsCodes)
+		_, err := b.ExecuteJavascriptCodesWithPage(operationPage, jsCodes)
 		if err != nil {
 			return err
 		}
 	}
 
-	page.Timeout(5 * time.Second).WaitNavigation(proto.PageLifecycleEventNameFirstMeaningfulPaint)()
+	paintPage := operationPage.Timeout(5 * time.Second)
+	defer paintPage.CancelTimeout()
+	paintPage.WaitNavigation(proto.PageLifecycleEventNameFirstMeaningfulPaint)()
 	return nil
 }
 
@@ -1440,7 +1450,10 @@ func (b *Browser) collectHeadlessFaviconFromNetwork(page *rod.Page, candidate he
 func (b *Browser) fetchHeadlessFavicon(page *rod.Page, candidate headlessFaviconCandidate) (HeadlessFavicon, bool) {
 	const maxFaviconBytes = 1024 * 1024
 
-	output, err := page.Timeout(10*time.Second).Eval(`async (candidate) => {
+	faviconPage := page.Timeout(10 * time.Second)
+	defer faviconPage.CancelTimeout()
+
+	output, err := faviconPage.Eval(`async (candidate) => {
 const maxBytes = candidate.maxBytes;
 const controller = new AbortController();
 const timer = setTimeout(() => controller.abort(), 8000);
@@ -1586,7 +1599,13 @@ return roots.some((root) => root.children.length > 0 || (root.textContent || "")
 
 // closePage closes the page and performs cleanup
 func (b *Browser) closePage(page *rod.Page) {
-	_ = page.Close()
+	if page == nil {
+		return
+	}
+
+	closePage := page.Context(context.Background()).Timeout(5 * time.Second)
+	defer closePage.CancelTimeout()
+	_ = closePage.Close()
 }
 
 func (b *Browser) Close() {
