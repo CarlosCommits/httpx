@@ -3,6 +3,7 @@ package httpx
 import (
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/projectdiscovery/retryablehttp-go"
 	"github.com/stretchr/testify/require"
@@ -119,4 +120,61 @@ func TestDefaultProtocolKeepsRetryableHTTP2FallbackClient(t *testing.T) {
 	require.NoError(t, err)
 	require.NotNil(t, ht.client)
 	require.NotSame(t, ht.client.HTTPClient, ht.client.HTTPClient2)
+}
+
+type blockingReadCloser struct{}
+
+func (*blockingReadCloser) Read([]byte) (int, error) {
+	select {}
+}
+
+func (*blockingReadCloser) Close() error {
+	return nil
+}
+
+type switchingProtocolsRoundTripper struct{}
+
+func (switchingProtocolsRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	return &http.Response{
+		Status:     "101 Switching Protocols",
+		StatusCode: http.StatusSwitchingProtocols,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Upgrade":    {"websocket"},
+			"Connection": {"Upgrade"},
+		},
+		Body:    &blockingReadCloser{},
+		Request: req,
+	}, nil
+}
+
+func TestDoSwitchingProtocolsDoesNotHang(t *testing.T) {
+	options := DefaultOptions
+	options.CdnCheck = "false"
+	options.Timeout = 2 * time.Second
+	options.RetryMax = 0
+
+	ht, err := New(&options)
+	require.NoError(t, err)
+
+	rt := switchingProtocolsRoundTripper{}
+	ht.client.HTTPClient.Transport = rt
+	ht.client.HTTPClient2.Transport = rt
+
+	req, err := retryablehttp.NewRequest(http.MethodGet, "http://example.com", nil)
+	require.NoError(t, err)
+
+	done := make(chan struct{})
+	go func() {
+		_, _ = ht.Do(req, UnsafeOptions{})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(4 * time.Second):
+		t.Fatal("Do hung on 101 Switching Protocols response")
+	}
 }
