@@ -229,9 +229,15 @@ func TestSameOriginScriptCandidatesIncludesModulePreloadsAndDynamicImports(t *te
 }
 
 func TestFetchSameOriginScriptBodiesUsesBoundedConcurrency(t *testing.T) {
-	const scriptCount = 6
+	const (
+		scriptCount = 6
+		userAgent   = "Stackray Chrome/149"
+	)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != userAgent {
+			t.Errorf("expected browser-derived user agent %q, got %q", userAgent, got)
+		}
 		time.Sleep(300 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/javascript")
 		_, _ = fmt.Fprintf(w, `console.log("script %s");`, r.URL.Path)
@@ -244,7 +250,7 @@ func TestFetchSameOriginScriptBodiesUsesBoundedConcurrency(t *testing.T) {
 	}
 
 	startedAt := time.Now()
-	collection := fetchSameOriginScriptBodies(body, nil, server.URL, map[string]struct{}{})
+	collection := fetchSameOriginScriptBodies(body, nil, server.URL, map[string]struct{}{}, userAgent)
 	elapsed := time.Since(startedAt)
 
 	if len(collection.Bodies) != scriptCount {

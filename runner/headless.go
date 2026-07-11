@@ -2238,7 +2238,7 @@ func (b *Browser) collectRuntimeResourceBodiesWithURLs(page *rod.Page, networkRe
 func (b *Browser) collectRuntimeScriptResourceBodies(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, pageBody string) runtimeScriptBodyCollection {
 	candidates := sameOriginScriptCandidates(pageBody, networkRequests, pageOrigin)
 	networkCollection := b.collectRuntimeResourceBodiesWithURLs(page, networkRequests, pageOrigin, isLikelyScriptRequest)
-	fallbackCollection := fetchSameOriginScriptBodies(pageBody, networkRequests, pageOrigin, networkCollection.CapturedURLs)
+	fallbackCollection := fetchSameOriginScriptBodies(pageBody, networkRequests, pageOrigin, networkCollection.CapturedURLs, b.defaultUserAgent)
 	bodies := append(networkCollection.Bodies, fallbackCollection.Bodies...)
 
 	return runtimeScriptBodyCollection{
@@ -2250,7 +2250,7 @@ func (b *Browser) collectRuntimeScriptResourceBodies(page *rod.Page, networkRequ
 	}
 }
 
-func fetchSameOriginScriptBodies(pageBody string, networkRequests []NetworkRequest, pageOrigin string, capturedURLs map[string]struct{}) runtimeBodyCollection {
+func fetchSameOriginScriptBodies(pageBody string, networkRequests []NetworkRequest, pageOrigin string, capturedURLs map[string]struct{}, userAgent string) runtimeBodyCollection {
 	const (
 		maxFetches        = 10
 		maxResourceBytes  = 2 * 1024 * 1024
@@ -2308,7 +2308,7 @@ launchLoop:
 		}
 		request.Header.Set("Accept", "application/javascript,text/javascript,*/*;q=0.8")
 		request.Header.Set("Referer", pageOrigin+"/")
-		request.Header.Set("User-Agent", fallbackDesktopChromeUserAgent)
+		request.Header.Set("User-Agent", userAgent)
 
 		wg.Add(1)
 		go func() {
