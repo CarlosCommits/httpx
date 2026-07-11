@@ -300,6 +300,36 @@ func TestParseHeadlessBrowserHeadersPreservesExtraHeaders(t *testing.T) {
 	}
 }
 
+func TestFilterHeadlessBrowserOwnedHeadersPreservesApplicationHeaders(t *testing.T) {
+	headers := []string{
+		"User-Agent: Chrome/128",
+		"Accept: text/html",
+		"Accept-Language: en-US,en;q=0.9",
+		"Sec-Fetch-Dest: document",
+		"Sec-Fetch-Mode: navigate",
+		`Sec-Ch-Ua: "Chromium";v="128"`,
+		"Sec-Ch-Ua-Mobile: ?0",
+		`Sec-Ch-Ua-Platform: "Linux"`,
+		"Authorization: Bearer secret",
+		"X-Tenant: tenant-01",
+	}
+
+	got := filterHeadlessBrowserOwnedHeaders(headers, true)
+	want := []string{
+		"Accept-Language: en-US,en;q=0.9",
+		"Authorization: Bearer secret",
+		"X-Tenant: tenant-01",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("expected native browser headers to preserve application headers %v, got %v", want, got)
+	}
+
+	unchanged := filterHeadlessBrowserOwnedHeaders(headers, false)
+	if fmt.Sprint(unchanged) != fmt.Sprint(headers) {
+		t.Fatalf("expected disabled filtering to preserve all headers, got %v", unchanged)
+	}
+}
+
 func TestBuildDesktopChromeUserAgentMetadataFollowsWindowsHeaders(t *testing.T) {
 	overrides := parseHeadlessBrowserHeaders([]string{
 		"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.6568.0 Safari/537.36",

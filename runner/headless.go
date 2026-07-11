@@ -947,6 +947,35 @@ type headlessBrowserHeaderOverrides struct {
 	SecCHUAPlatform string
 }
 
+func filterHeadlessBrowserOwnedHeaders(headers []string, useNativeHeaders bool) []string {
+	if !useNativeHeaders {
+		return headers
+	}
+
+	filtered := make([]string, 0, len(headers))
+	for _, header := range headers {
+		headerParts := strings.SplitN(header, ":", 2)
+		if len(headerParts) != 2 {
+			filtered = append(filtered, header)
+			continue
+		}
+
+		name := strings.ToLower(strings.TrimSpace(headerParts[0]))
+		switch {
+		case name == "accept", name == "user-agent":
+			continue
+		case strings.HasPrefix(name, "sec-ch-ua"):
+			continue
+		case strings.HasPrefix(name, "sec-fetch-"):
+			continue
+		default:
+			filtered = append(filtered, header)
+		}
+	}
+
+	return filtered
+}
+
 func parseHeadlessBrowserHeaders(headers []string) headlessBrowserHeaderOverrides {
 	overrides := headlessBrowserHeaderOverrides{
 		ExtraHeaders:   []string{},
