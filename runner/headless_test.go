@@ -229,9 +229,15 @@ func TestSameOriginScriptCandidatesIncludesModulePreloadsAndDynamicImports(t *te
 }
 
 func TestFetchSameOriginScriptBodiesUsesBoundedConcurrency(t *testing.T) {
-	const scriptCount = 6
+	const (
+		scriptCount = 6
+		userAgent   = "Stackray Chrome/149"
+	)
 
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get("User-Agent"); got != userAgent {
+			t.Errorf("expected browser-derived user agent %q, got %q", userAgent, got)
+		}
 		time.Sleep(300 * time.Millisecond)
 		w.Header().Set("Content-Type", "application/javascript")
 		_, _ = fmt.Fprintf(w, `console.log("script %s");`, r.URL.Path)
@@ -244,7 +250,7 @@ func TestFetchSameOriginScriptBodiesUsesBoundedConcurrency(t *testing.T) {
 	}
 
 	startedAt := time.Now()
-	collection := fetchSameOriginScriptBodies(body, nil, server.URL, map[string]struct{}{})
+	collection := fetchSameOriginScriptBodies(body, nil, server.URL, map[string]struct{}{}, userAgent)
 	elapsed := time.Since(startedAt)
 
 	if len(collection.Bodies) != scriptCount {
@@ -291,6 +297,36 @@ func TestParseHeadlessBrowserHeadersPreservesExtraHeaders(t *testing.T) {
 	wantExtraHeaders := []string{"Accept", "text/html", "Sec-Fetch-Site", "none"}
 	if fmt.Sprint(overrides.ExtraHeaders) != fmt.Sprint(wantExtraHeaders) {
 		t.Fatalf("expected extra headers %v, got %v", wantExtraHeaders, overrides.ExtraHeaders)
+	}
+}
+
+func TestFilterHeadlessBrowserOwnedHeadersPreservesApplicationHeaders(t *testing.T) {
+	headers := []string{
+		"User-Agent: Chrome/128",
+		"Accept: text/html",
+		"Accept-Language: en-US,en;q=0.9",
+		"Sec-Fetch-Dest: document",
+		"Sec-Fetch-Mode: navigate",
+		`Sec-Ch-Ua: "Chromium";v="128"`,
+		"Sec-Ch-Ua-Mobile: ?0",
+		`Sec-Ch-Ua-Platform: "Linux"`,
+		"Authorization: Bearer secret",
+		"X-Tenant: tenant-01",
+	}
+
+	got := filterHeadlessBrowserOwnedHeaders(headers, true)
+	want := []string{
+		"Accept-Language: en-US,en;q=0.9",
+		"Authorization: Bearer secret",
+		"X-Tenant: tenant-01",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("expected native browser headers to preserve application headers %v, got %v", want, got)
+	}
+
+	unchanged := filterHeadlessBrowserOwnedHeaders(headers, false)
+	if fmt.Sprint(unchanged) != fmt.Sprint(headers) {
+		t.Fatalf("expected disabled filtering to preserve all headers, got %v", unchanged)
 	}
 }
 

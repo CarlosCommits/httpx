@@ -339,23 +339,24 @@ type Options struct {
 	ListOutputFields          bool
 	ExcludeOutputFields       goflags.StringSlice
 	//The OnResult callback function is invoked for each result. It is important to check for errors in the result before using Result.Err.
-	OnResult             OnResultCallback
-	DisableUpdateCheck   bool
-	NoDecode             bool
-	Screenshot           bool
-	UseInstalledChrome   bool
-	BrowserRecovery      string
-	ChromeBin            string
-	ChromeSettleTimeout  time.Duration
-	ChromeWindowSize     string
-	TlsImpersonate       bool
-	DisableStdin         bool
-	HttpApiEndpoint      string
-	NoScreenshotBytes    bool
-	NoHeadlessBody       bool
-	NoScreenshotFullPage bool
-	ScreenshotTimeout    time.Duration
-	ScreenshotIdle       time.Duration
+	OnResult                     OnResultCallback
+	DisableUpdateCheck           bool
+	NoDecode                     bool
+	Screenshot                   bool
+	UseInstalledChrome           bool
+	HeadlessBrowserNativeHeaders bool
+	BrowserRecovery              string
+	ChromeBin                    string
+	ChromeSettleTimeout          time.Duration
+	ChromeWindowSize             string
+	TlsImpersonate               bool
+	DisableStdin                 bool
+	HttpApiEndpoint              string
+	NoScreenshotBytes            bool
+	NoHeadlessBody               bool
+	NoScreenshotFullPage         bool
+	ScreenshotTimeout            time.Duration
+	ScreenshotIdle               time.Duration
 	// HeadlessOptionalArguments specifies optional arguments to pass to Chrome
 	HeadlessOptionalArguments goflags.StringSlice
 	Protocol                  string
@@ -443,6 +444,7 @@ func ParseOptions() *Options {
 	flagSet.CreateGroup("headless", "Headless",
 		flagSet.BoolVarP(&options.Screenshot, "screenshot", "ss", false, "enable saving screenshot of the page using headless browser"),
 		flagSet.BoolVar(&options.UseInstalledChrome, "system-chrome", false, "enable using local installed chrome for screenshot"),
+		flagSet.BoolVar(&options.HeadlessBrowserNativeHeaders, "headless-browser-native-headers", false, "let Chrome generate browser-owned headers while retaining custom application headers"),
 		flagSet.StringVar(&options.BrowserRecovery, "browser-recovery", "", "browser recovery mode for blocked pages (real-chrome)"),
 		flagSet.StringVar(&options.ChromeBin, "chrome-bin", "", "path to Chrome binary for browser recovery"),
 		flagSet.DurationVar(&options.ChromeSettleTimeout, "chrome-settle-timeout", 45*time.Second, "maximum time to let real Chrome load before collecting browser recovery evidence"),

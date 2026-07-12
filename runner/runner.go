@@ -2555,6 +2555,7 @@ retry:
 	)
 	var pHash uint64
 	if scanopts.Screenshot || scanopts.HeadlessTechDetect {
+		browserHeaders := filterHeadlessBrowserOwnedHeaders(r.options.CustomHeaders, r.options.HeadlessBrowserNativeHeaders)
 		var err error
 		var headlessResult *HeadlessVisitResult
 		if scanopts.BrowserRecovery == BrowserRecoveryRealChrome {
@@ -2563,7 +2564,7 @@ retry:
 				Timeout:                 scanopts.ChromeSettleTimeout + scanopts.ScreenshotTimeout + 10*time.Second,
 				ArtifactTimeout:         scanopts.ScreenshotTimeout,
 				Idle:                    scanopts.ScreenshotIdle,
-				Headers:                 r.options.CustomHeaders,
+				Headers:                 browserHeaders,
 				FullPage:                scanopts.IsScreenshotFullPage(),
 				JSCodes:                 r.options.JavascriptCodes,
 				CaptureScreenshot:       scanopts.Screenshot,
@@ -2581,7 +2582,7 @@ retry:
 			headlessResult, err = r.browser.VisitWithArtifacts(fullURL, HeadlessVisitOptions{
 				Timeout:                 scanopts.ScreenshotTimeout,
 				Idle:                    scanopts.ScreenshotIdle,
-				Headers:                 r.options.CustomHeaders,
+				Headers:                 browserHeaders,
 				FullPage:                scanopts.IsScreenshotFullPage(),
 				JSCodes:                 r.options.JavascriptCodes,
 				CaptureScreenshot:       scanopts.Screenshot,
