@@ -1743,7 +1743,11 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 	matchedRuntimeVersions := map[string]string{}
 
 	phaseStartedAt = time.Now()
-	pageOrigin := b.collectRuntimePageOrigin(page)
+	pageOrigin := b.collectRuntimePageOrigin(page, networkRequests...)
+	metrics.PageOriginResolved = pageOrigin != ""
+	if !metrics.PageOriginResolved {
+		metrics.Partial = true
+	}
 	metrics.PhaseDurationsMs["page_origin"] = time.Since(phaseStartedAt).Milliseconds()
 	metrics.SameOriginRequestCount = countSameOriginRequests(networkRequests, pageOrigin)
 	metrics.ScriptRequestCount = countRequestsByResourceType(networkRequests, "script")
@@ -1871,7 +1875,7 @@ func (b *Browser) detectRuntimeTechnologies(page *rod.Page, networkRequests []Ne
 	}
 
 	phaseStartedAt = time.Now()
-	addRuntimeBundleTechnologies(technologies, wappalyzerClient, originalFingerprints, pageBody, networkRequests, scriptCollection.Bodies)
+	addRuntimeBundleTechnologies(technologies, wappalyzerClient, originalFingerprints, pageBody, networkRequests, scriptCollection.Bodies, pageOrigin)
 	metrics.PhaseDurationsMs["bundle_heuristics"] = time.Since(phaseStartedAt).Milliseconds()
 
 	return technologies, metrics
@@ -1906,11 +1910,11 @@ func addRuntimeTechnology(technologies map[string]wappalyzer.AppInfo, wappalyzer
 	}
 }
 
-func addRuntimeBundleTechnologies(technologies map[string]wappalyzer.AppInfo, wappalyzerClient *wappalyzer.Wappalyze, originalFingerprints *wappalyzer.Fingerprints, pageBody string, networkRequests []NetworkRequest, scriptBodies []string) {
+func addRuntimeBundleTechnologies(technologies map[string]wappalyzer.AppInfo, wappalyzerClient *wappalyzer.Wappalyze, originalFingerprints *wappalyzer.Fingerprints, pageBody string, networkRequests []NetworkRequest, scriptBodies []string, pageOrigin string) {
 	if hasReactBundleEvidence(scriptBodies) {
 		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "React", "")
 	}
-	if hasViteBundleEvidence(pageBody, networkRequests, scriptBodies) {
+	if hasViteBundleEvidence(pageBody, networkRequests, scriptBodies, pageOrigin) {
 		addRuntimeTechnology(technologies, wappalyzerClient, originalFingerprints, "Vite", "")
 	}
 	if hasTanStackRouterBundleEvidence(pageBody, scriptBodies) {
@@ -2187,19 +2191,45 @@ func (b *Browser) collectRuntimeDocumentCookies(page *rod.Page) map[string]strin
 	return cookies
 }
 
-func (b *Browser) collectRuntimePageOrigin(page *rod.Page) string {
-	output, err := page.Eval(`() => window.location.origin`)
-	if err != nil {
+func (b *Browser) collectRuntimePageOrigin(page *rod.Page, networkRequests ...NetworkRequest) string {
+	if page != nil {
+		if info, err := page.Info(); err == nil && info != nil {
+			if origin := runtimePageOrigin(info.URL); origin != "" {
+				return origin
+			}
+		}
+
+		if output, err := page.Eval(`() => window.location.origin`); err == nil {
+			rawValue := fmt.Sprint(output.Value)
+			var origin string
+			if err := json.Unmarshal([]byte(rawValue), &origin); err != nil {
+				origin = rawValue
+			}
+			if origin := runtimePageOrigin(origin); origin != "" {
+				return origin
+			}
+		}
+	}
+
+	for _, request := range networkRequests {
+		if !strings.EqualFold(request.ResourceType, "document") {
+			continue
+		}
+		if origin := runtimePageOrigin(request.URL); origin != "" {
+			return origin
+		}
+	}
+
+	return ""
+}
+
+func runtimePageOrigin(rawURL string) string {
+	parsedURL, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsedURL.Host == "" || !stringsutil.EqualFoldAny(parsedURL.Scheme, "http", "https") {
 		return ""
 	}
 
-	rawValue := fmt.Sprint(output.Value)
-	var origin string
-	if err := json.Unmarshal([]byte(rawValue), &origin); err != nil {
-		origin = rawValue
-	}
-
-	return strings.ToLower(origin)
+	return strings.ToLower(parsedURL.Scheme + "://" + parsedURL.Host)
 }
 
 func (b *Browser) collectRuntimeResourceBodiesWithURLs(page *rod.Page, networkRequests []NetworkRequest, pageOrigin string, predicate func(NetworkRequest) bool) runtimeBodyCollection {
@@ -2208,6 +2238,9 @@ func (b *Browser) collectRuntimeResourceBodiesWithURLs(page *rod.Page, networkRe
 		maxResourceBytes  = 2 * 1024 * 1024
 		maxTotalBodyBytes = 8 * 1024 * 1024
 	)
+	if pageOrigin == "" {
+		return runtimeBodyCollection{}
+	}
 
 	bodies := make([]string, 0)
 	seen := map[string]struct{}{}
@@ -2221,7 +2254,7 @@ func (b *Browser) collectRuntimeResourceBodiesWithURLs(page *rod.Page, networkRe
 		if request.RequestID == "" || request.StatusCode != 200 || !predicate(request) {
 			continue
 		}
-		if pageOrigin != "" && !isSameOriginRequest(request.URL, pageOrigin) {
+		if !isSameOriginRequest(request.URL, pageOrigin) {
 			continue
 		}
 		if _, ok := seen[request.URL]; ok {
@@ -2700,27 +2733,27 @@ func (b *Browser) hasTanStackRouterRuntimeEvidence(page *rod.Page) bool {
 	return strings.EqualFold(fmt.Sprint(output.Value), "true")
 }
 
-func hasViteBundleEvidence(pageBody string, networkRequests []NetworkRequest, scriptBodies []string) bool {
+func hasViteBundleEvidence(pageBody string, networkRequests []NetworkRequest, scriptBodies []string, pageOrigin string) bool {
 	body := strings.ToLower(pageBody)
 	if strings.Contains(body, "data-vite") {
 		return true
 	}
 
-	hasModuleAsset := hasViteModuleAsset(body, networkRequests)
+	hasModuleAsset := hasViteModuleAsset(body, networkRequests, pageOrigin)
 	if !hasModuleAsset {
 		return false
 	}
 
-	return hasViteStylesheetAsset(body, networkRequests) && hasViteModulePreloadEvidence(body, scriptBodies)
+	return hasViteStylesheetAsset(body, networkRequests, pageOrigin) && hasViteModulePreloadEvidence(body, scriptBodies)
 }
 
-func hasViteModuleAsset(body string, networkRequests []NetworkRequest) bool {
+func hasViteModuleAsset(body string, networkRequests []NetworkRequest, pageOrigin string) bool {
 	if viteModuleScriptPattern.MatchString(body) {
 		return true
 	}
 
 	for _, request := range networkRequests {
-		if strings.EqualFold(request.ResourceType, "script") && viteAssetScriptPathPattern.MatchString(strings.ToLower(request.URL)) {
+		if pageOrigin != "" && isSameOriginRequest(request.URL, pageOrigin) && strings.EqualFold(request.ResourceType, "script") && viteAssetScriptPathPattern.MatchString(strings.ToLower(request.URL)) {
 			return true
 		}
 	}
@@ -2728,13 +2761,13 @@ func hasViteModuleAsset(body string, networkRequests []NetworkRequest) bool {
 	return false
 }
 
-func hasViteStylesheetAsset(body string, networkRequests []NetworkRequest) bool {
+func hasViteStylesheetAsset(body string, networkRequests []NetworkRequest, pageOrigin string) bool {
 	if viteStylesheetPattern.MatchString(body) {
 		return true
 	}
 
 	for _, request := range networkRequests {
-		if strings.EqualFold(request.ResourceType, "stylesheet") && viteAssetStylePathPattern.MatchString(strings.ToLower(request.URL)) {
+		if pageOrigin != "" && isSameOriginRequest(request.URL, pageOrigin) && strings.EqualFold(request.ResourceType, "stylesheet") && viteAssetStylePathPattern.MatchString(strings.ToLower(request.URL)) {
 			return true
 		}
 	}
@@ -2858,14 +2891,14 @@ func (b *Browser) matchCookieFingerprint(fingerprint *wappalyzer.Fingerprint, co
 }
 
 func (b *Browser) matchHeaderFingerprint(fingerprint *wappalyzer.Fingerprint, networkRequests []NetworkRequest, pageOrigin string) (bool, string) {
-	if len(fingerprint.Headers) == 0 || len(networkRequests) == 0 {
+	if pageOrigin == "" || len(fingerprint.Headers) == 0 || len(networkRequests) == 0 {
 		return false, ""
 	}
 
 	version := ""
 
 	for _, request := range networkRequests {
-		if pageOrigin != "" && !isSameOriginRequest(request.URL, pageOrigin) {
+		if !isSameOriginRequest(request.URL, pageOrigin) {
 			continue
 		}
 		if len(request.ResponseHeaders) == 0 {

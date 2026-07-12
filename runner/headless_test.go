@@ -63,7 +63,7 @@ func TestRuntimeBundleTechnologiesAddsReactFromBacktickRuntimeSymbols(t *testing
 		"var p=symbol.for(`react.transitional.element`),r=symbol.for(`react.portal`),e=symbol.for(`react.fragment`),y=symbol.for(`react.strict_mode`),p=symbol.for(`react.profiler`),w=symbol.for(`react.consumer`),m=symbol.for(`react.context`),t=symbol.for(`react.forward_ref`),i=symbol.for(`react.suspense`),t=symbol.for(`react.memo`),c=symbol.for(`react.lazy`);",
 	}
 
-	addRuntimeBundleTechnologies(technologies, wappalyzerClient, wappalyzerClient.GetFingerprints(), "", nil, scriptBodies)
+	addRuntimeBundleTechnologies(technologies, wappalyzerClient, wappalyzerClient.GetFingerprints(), "", nil, scriptBodies, "")
 
 	if _, ok := technologies["React"]; !ok {
 		t.Fatal("expected React to be added from runtime bundle evidence")
@@ -76,7 +76,7 @@ func TestRuntimeBundleTechnologiesAddsCustomTanStackTechnologies(t *testing.T) {
 	pageBody := `window.__TSR={};$_TSR.router={};<script id="tsr-scroll-restoration-v1_3"></script><script id="tsr-stream-barrier"></script>`
 	scriptBodies := []string{`/*! @tanstack/react-query */ import "@tanstack/query-core";`}
 
-	addRuntimeBundleTechnologies(technologies, wappalyzerClient, wappalyzerClient.GetFingerprints(), pageBody, nil, scriptBodies)
+	addRuntimeBundleTechnologies(technologies, wappalyzerClient, wappalyzerClient.GetFingerprints(), pageBody, nil, scriptBodies, "")
 
 	for _, name := range []string{"TanStack Router", "TanStack Start", "TanStack Query"} {
 		if _, ok := technologies[name]; !ok {
@@ -127,7 +127,7 @@ func TestHasTanStackQueryBundleEvidenceRequiresPackageMarker(t *testing.T) {
 func TestHasViteBundleEvidenceFromDataVite(t *testing.T) {
 	body := `<style data-vite-theme="" data-inject-first=""></style>`
 
-	if !hasViteBundleEvidence(body, nil, nil) {
+	if !hasViteBundleEvidence(body, nil, nil, "") {
 		t.Fatal("expected data-vite attribute to be detected")
 	}
 }
@@ -165,7 +165,7 @@ func TestHasViteBundleEvidenceFromModuleAssets(t *testing.T) {
 		`<link rel="stylesheet" crossorigin href="/assets/index-CWP6jorY.css">`
 	scriptBodies := []string{`const scriptRel = "modulepreload";`}
 
-	if !hasViteBundleEvidence(body, nil, scriptBodies) {
+	if !hasViteBundleEvidence(body, nil, scriptBodies, "") {
 		t.Fatal("expected Vite module asset evidence to be detected")
 	}
 }
@@ -173,8 +173,30 @@ func TestHasViteBundleEvidenceFromModuleAssets(t *testing.T) {
 func TestHasViteBundleEvidenceRequiresMultipleSignals(t *testing.T) {
 	body := `<script type="module" crossorigin src="/assets/index-DyXVzQOV.js"></script>`
 
-	if hasViteBundleEvidence(body, nil, nil) {
+	if hasViteBundleEvidence(body, nil, nil, "") {
 		t.Fatal("expected lone module asset to be ignored")
+	}
+}
+
+func TestHasViteBundleEvidenceIgnoresCrossOriginNetworkAssets(t *testing.T) {
+	requests := []NetworkRequest{
+		{URL: "https://third-party.example/assets/app.js", ResourceType: "Script"},
+		{URL: "https://third-party.example/assets/app.css", ResourceType: "Stylesheet"},
+	}
+
+	if hasViteBundleEvidence("modulepreload", requests, nil, "https://example.com") {
+		t.Fatal("expected cross-origin Vite-like assets to be ignored")
+	}
+}
+
+func TestHasViteBundleEvidenceUsesSameOriginNetworkAssets(t *testing.T) {
+	requests := []NetworkRequest{
+		{URL: "https://example.com/assets/app.js", ResourceType: "Script"},
+		{URL: "https://example.com/assets/app.css", ResourceType: "Stylesheet"},
+	}
+
+	if !hasViteBundleEvidence("modulepreload", requests, nil, "https://example.com") {
+		t.Fatal("expected same-origin Vite assets to be detected")
 	}
 }
 
@@ -561,5 +583,62 @@ func TestMatchHeaderFingerprintIgnoresThirdPartyBrowserHeaders(t *testing.T) {
 	matched, _ := (&Browser{}).matchHeaderFingerprint(fingerprint, requests, "https://example.com")
 	if matched {
 		t.Fatal("expected third-party browser response header to be ignored")
+	}
+}
+
+func TestMatchHeaderFingerprintFailsClosedWithoutPageOrigin(t *testing.T) {
+	requests := []NetworkRequest{
+		{
+			URL:             "https://third-party.example/api/status",
+			StatusCode:      200,
+			ResponseHeaders: map[string]string{"server": "kestrel"},
+		},
+	}
+	fingerprint := &wappalyzer.Fingerprint{
+		Headers: map[string]string{"server": "kestrel"},
+	}
+
+	matched, _ := (&Browser{}).matchHeaderFingerprint(fingerprint, requests, "")
+	if matched {
+		t.Fatal("expected browser response headers to be ignored when page origin is unavailable")
+	}
+}
+
+func TestCollectRuntimeResourceBodiesFailsClosedWithoutPageOrigin(t *testing.T) {
+	collection := (&Browser{}).collectRuntimeResourceBodiesWithURLs(nil, []NetworkRequest{
+		{
+			RequestID:    "third-party-script",
+			URL:          "https://third-party.example/app.js",
+			ResourceType: "Script",
+			StatusCode:   200,
+		},
+	}, "", isLikelyScriptRequest)
+
+	if len(collection.Bodies) != 0 || collection.Bytes != 0 {
+		t.Fatalf("expected no resource bodies without page origin, got %#v", collection)
+	}
+}
+
+func TestRuntimePageOriginNormalizesHTTPURLs(t *testing.T) {
+	for rawURL, want := range map[string]string{
+		"https://Example.com/path?query=1": "https://example.com",
+		"http://Example.com:8080/path":     "http://example.com:8080",
+		"file:///tmp/index.html":           "",
+		"not a URL":                        "",
+	} {
+		if got := runtimePageOrigin(rawURL); got != want {
+			t.Fatalf("runtimePageOrigin(%q) = %q, want %q", rawURL, got, want)
+		}
+	}
+}
+
+func TestCollectRuntimePageOriginFallsBackToDocumentRequest(t *testing.T) {
+	requests := []NetworkRequest{
+		{URL: "https://example.com/final/path", ResourceType: "Document", StatusCode: 200},
+		{URL: "https://third-party.example/frame", ResourceType: "Document", StatusCode: 200},
+	}
+
+	if got := (&Browser{}).collectRuntimePageOrigin(nil, requests...); got != "https://example.com" {
+		t.Fatalf("expected main document origin fallback, got %q", got)
 	}
 }

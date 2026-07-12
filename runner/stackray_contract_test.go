@@ -207,6 +207,7 @@ func TestStackrayContractRuntimeTechnologyMetricsJSONShape(t *testing.T) {
 		TechDetectMetrics: &RuntimeTechnologyDetectionMetrics{
 			Enabled:                      true,
 			Partial:                      true,
+			PageOriginResolved:           true,
 			StopReason:                   "artifact_capture_failed",
 			DurationMs:                   1234,
 			PhaseDurationsMs:             map[string]int64{"script_bodies": 456},
@@ -230,6 +231,9 @@ func TestStackrayContractRuntimeTechnologyMetricsJSONShape(t *testing.T) {
 	}
 	if rawMetrics["partial"] != true {
 		t.Fatalf("expected partial to be serialized, got %#v", rawMetrics["partial"])
+	}
+	if rawMetrics["page_origin_resolved"] != true {
+		t.Fatalf("expected page_origin_resolved to be serialized, got %#v", rawMetrics["page_origin_resolved"])
 	}
 	if got, ok := rawMetrics["duration_ms"].(float64); !ok || int(got) != 1234 {
 		t.Fatalf("expected duration_ms 1234, got %#v", rawMetrics["duration_ms"])
