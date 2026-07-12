@@ -35,6 +35,7 @@ type RuntimeTechnologyDetectionMetrics struct {
 	PhaseDurationsMs               map[string]int64 `json:"phase_durations_ms,omitempty"`
 	NetworkRequestCount            int              `json:"network_request_count,omitempty"`
 	SameOriginRequestCount         int              `json:"same_origin_request_count,omitempty"`
+	PageOriginResolved             bool             `json:"page_origin_resolved"`
 	ScriptRequestCount             int              `json:"script_request_count,omitempty"`
 	SameOriginScriptCandidateCount int              `json:"same_origin_script_candidate_count,omitempty"`
 	PendingSameOriginScriptCount   int              `json:"pending_same_origin_script_count,omitempty"`
