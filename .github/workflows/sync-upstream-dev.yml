@@ -253,3 +253,31 @@ jobs:
           else
             gh issue create --repo "${GITHUB_REPOSITORY}" --title "$TITLE" --body-file "$body_file" --label upstream-sync
           fi
+
+  close-resolved-issue:
+    name: Close resolved upstream sync issue
+    needs: [sync, validate, merge]
+    if: >-
+      always() &&
+      needs.sync.result == 'success' &&
+      (needs.validate.result == 'success' || needs.validate.result == 'skipped') &&
+      (needs.merge.result == 'success' || needs.merge.result == 'skipped')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Close blocked sync issue
+        env:
+          GH_TOKEN: ${{ secrets.UPSTREAM_SYNC_TOKEN || github.token }}
+          TITLE: Upstream httpx sync blocked
+        run: |
+          issue_number="$(gh issue list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --state open \
+            --search "${TITLE} in:title" \
+            --json number,title \
+            --jq ".[] | select(.title == \"${TITLE}\") | .number" | head -n 1)"
+
+          if [ -n "$issue_number" ]; then
+            gh issue close "$issue_number" \
+              --repo "${GITHUB_REPOSITORY}" \
+              --comment "The upstream sync is no longer blocked. Resolved by ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}."
+          fi
