@@ -114,6 +114,7 @@ PROBES:
    -td, -tech-detect                      display technology in use based on wappalyzer dataset
    -tdh, -tech-detect-headless            enhance technology detection using headless browser JavaScript, DOM, cookies, and loaded resources
    -cff, -custom-fingerprint-file string  path to a custom fingerprint file for technology detection
+   -kb, -knowledge-base                   enable knowledge base classification
    -method                                display http request method
    -ws, -websocket                        display server using websocket
    -ip                                    display host ip
