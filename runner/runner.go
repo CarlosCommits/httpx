@@ -2552,6 +2552,7 @@ retry:
 		browserMode     string
 		runtimeMatches  map[string]wappalyzer.AppInfo
 		runtimeMetrics  *RuntimeTechnologyDetectionMetrics
+		browserResponse *BrowserResponseEvidence
 	)
 	var pHash uint64
 	if scanopts.Screenshot || scanopts.HeadlessTechDetect {
@@ -2575,7 +2576,6 @@ retry:
 				Proxy:                   r.options.Proxy,
 				SettleTimeout:           scanopts.ChromeSettleTimeout,
 				WindowSize:              scanopts.ChromeWindowSize,
-				ResponseHeaders:         resp.Headers,
 			})
 		} else {
 			browserMode = "headless"
@@ -2601,6 +2601,7 @@ retry:
 			linkRequest = headlessResult.NetworkRequests
 			runtimeMatches = headlessResult.RuntimeMatches
 			runtimeMetrics = headlessResult.RuntimeMetrics
+			browserResponse = headlessResult.BrowserResponse
 			if scanopts.Favicon && faviconMMH3 == "" {
 				faviconMMH3, faviconMD5, faviconPath, faviconData, faviconURL = r.HandleHeadlessFaviconHash(headlessResult.Favicons)
 				if faviconMMH3 != "" && !faviconPrinted {
@@ -2771,6 +2772,7 @@ retry:
 		HeadlessBody:      headlessBody,
 		TechDetectMetrics: runtimeMetrics,
 		BrowserMode:       browserMode,
+		BrowserResponse:   browserResponse,
 		KnowledgeBase:     r.classifyPage(headlessBody, respData, pHash),
 		TechnologyDetails: technologyDetails,
 		Resolvers:         resolvers,

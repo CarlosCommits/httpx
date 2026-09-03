@@ -119,6 +119,7 @@ type Result struct {
 	HeadlessBody       string                             `json:"headless_body,omitempty" csv:"headless_body" md:"headless_body" mapstructure:"headless_body"`
 	TechDetectMetrics  *RuntimeTechnologyDetectionMetrics `json:"tech_detection_metrics,omitempty" csv:"-" md:"-" mapstructure:"tech_detection_metrics"`
 	BrowserMode        string                             `json:"browser_mode,omitempty" csv:"browser_mode" md:"browser_mode" mapstructure:"browser_mode"`
+	BrowserResponse    *BrowserResponseEvidence           `json:"browser_response,omitempty" csv:"-" md:"-" mapstructure:"browser_response"`
 	ScreenshotBytes    []byte                             `json:"screenshot_bytes,omitempty" csv:"screenshot_bytes" md:"screenshot_bytes" mapstructure:"screenshot_bytes"`
 	StoredResponsePath string                             `json:"stored_response_path,omitempty" csv:"stored_response_path" md:"stored_response_path" mapstructure:"stored_response_path"`
 	ScreenshotPath     string                             `json:"screenshot_path,omitempty" csv:"screenshot_path" md:"screenshot_path" mapstructure:"screenshot_path"`

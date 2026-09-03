@@ -169,6 +169,34 @@ func TestStackrayContractHeadlessTitleJSONShape(t *testing.T) {
 	}
 }
 
+func TestStackrayContractBrowserResponseJSONShape(t *testing.T) {
+	result := Result{
+		URL: "https://example.com",
+		BrowserResponse: &BrowserResponseEvidence{
+			FinalURL:        "https://example.com/",
+			StatusCode:      http.StatusOK,
+			Title:           "Browser title",
+			ResponseHeaders: map[string]string{"content-type": "text/html"},
+			Hashes:          map[string]string{"body_sha256": "browser-body-hash"},
+		},
+	}
+
+	var row map[string]any
+	if err := json.Unmarshal([]byte(result.JSON(nil)), &row); err != nil {
+		t.Fatalf("expected Stackray JSONL row to be valid JSON: %v", err)
+	}
+	browserResponse, ok := row["browser_response"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected browser_response object, got %#v", row["browser_response"])
+	}
+	if browserResponse["final_url"] != "https://example.com/" || browserResponse["title"] != "Browser title" {
+		t.Fatalf("expected browser response fields to be preserved, got %#v", browserResponse)
+	}
+	if status, ok := browserResponse["status_code"].(float64); !ok || int(status) != http.StatusOK {
+		t.Fatalf("expected browser status code, got %#v", browserResponse["status_code"])
+	}
+}
+
 func TestStackrayContractVersionedCPEJSONShape(t *testing.T) {
 	result := Result{
 		URL: "https://example.com",
