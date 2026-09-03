@@ -1,6 +1,7 @@
 package runner
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -24,6 +25,7 @@ import (
 	"github.com/go-rod/rod/lib/launcher/flags"
 	"github.com/go-rod/rod/lib/proto"
 	"github.com/pkg/errors"
+	"github.com/projectdiscovery/httpx/common/hashes"
 	fileutil "github.com/projectdiscovery/utils/file"
 	osutils "github.com/projectdiscovery/utils/os"
 	stringsutil "github.com/projectdiscovery/utils/strings"
@@ -31,19 +33,22 @@ import (
 )
 
 type NetworkRequest struct {
-	RequestID       string
-	URL             string
-	Method          string
-	ResourceType    string
-	StatusCode      int
-	ErrorType       string
-	ResponseHeaders map[string]string `json:"-"`
+	RequestID          string
+	FrameID            string
+	URL                string
+	Method             string
+	ResourceType       string
+	StatusCode         int
+	ErrorType          string
+	ResponseHeaders    map[string]string `json:"-"`
+	RawResponseHeaders map[string]string `json:"-"`
 }
 
 type headlessNetworkTracker struct {
 	mu        sync.Mutex
 	requests  map[string]*NetworkRequest
 	order     []string
+	history   []NetworkRequest
 	lastEvent time.Time
 }
 
@@ -62,7 +67,9 @@ func (t *headlessNetworkTracker) start(request NetworkRequest) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	if _, ok := t.requests[request.RequestID]; !ok {
+	if previous, ok := t.requests[request.RequestID]; ok {
+		t.history = append(t.history, *previous)
+	} else {
 		t.order = append(t.order, request.RequestID)
 	}
 	requestCopy := request
@@ -83,6 +90,7 @@ func (t *headlessNetworkTracker) response(requestID string, status int, resource
 		request.ResourceType = resourceType
 	}
 	request.ResponseHeaders = normalizeNetworkHeaders(headers)
+	request.RawResponseHeaders = preserveNetworkHeaders(headers)
 	t.lastEvent = time.Now()
 }
 
@@ -117,7 +125,8 @@ func (t *headlessNetworkTracker) snapshot() []NetworkRequest {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	requests := make([]NetworkRequest, 0, len(t.order))
+	requests := make([]NetworkRequest, 0, len(t.history)+len(t.order))
+	requests = append(requests, t.history...)
 	for _, requestID := range t.order {
 		request, ok := t.requests[requestID]
 		if !ok {
@@ -197,6 +206,32 @@ type HeadlessVisitResult struct {
 	NetworkRequests []NetworkRequest
 	RuntimeMatches  map[string]wappalyzer.AppInfo
 	RuntimeMetrics  *RuntimeTechnologyDetectionMetrics
+	BrowserResponse *BrowserResponseEvidence
+}
+
+type BrowserResponseEvidence struct {
+	URL              string             `json:"url,omitempty"`
+	FinalURL         string             `json:"final_url,omitempty"`
+	StatusCode       int                `json:"status_code"`
+	Title            string             `json:"title,omitempty"`
+	WebServer        string             `json:"webserver,omitempty"`
+	ContentType      string             `json:"content_type,omitempty"`
+	ContentLength    int                `json:"content_length"`
+	Location         string             `json:"location,omitempty"`
+	ResponseHeaders  map[string]string  `json:"header,omitempty"`
+	RawHeaders       string             `json:"raw_header,omitempty"`
+	Hashes           map[string]string  `json:"hash,omitempty"`
+	Words            int                `json:"words"`
+	Lines            int                `json:"lines"`
+	ChainStatusCodes []int              `json:"chain_status_codes,omitempty"`
+	Chain            []BrowserChainItem `json:"chain,omitempty"`
+	Failed           bool               `json:"failed"`
+}
+
+type BrowserChainItem struct {
+	StatusCode int    `json:"status_code"`
+	Location   string `json:"location,omitempty"`
+	RequestURL string `json:"request-url,omitempty"`
 }
 
 type RealChromeRecoveryOptions struct {
@@ -214,7 +249,6 @@ type RealChromeRecoveryOptions struct {
 	Proxy                   string
 	SettleTimeout           time.Duration
 	WindowSize              string
-	ResponseHeaders         map[string][]string
 }
 
 type runtimeBodyCollection struct {
@@ -429,6 +463,7 @@ func (b *Browser) VisitWithArtifacts(url string, options HeadlessVisitOptions) (
 		NetworkRequests: networkRequests,
 		RuntimeMatches:  map[string]wappalyzer.AppInfo{},
 	}
+	result.BrowserResponse = captureBrowserResponseEvidence(artifactPage, body, title, networkRequests)
 	if options.CaptureFavicon {
 		result.Favicons = b.collectHeadlessFavicons(artifactPage, body, networkRequests)
 	}
@@ -588,8 +623,13 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 			return nil, err
 		}
 	} else {
-		seedRealChromeDocumentRequest(networkTracker, page, normalizeHTTPResponseHeaders(options.ResponseHeaders))
-		seedPerformanceResourceRequests(networkTracker, page)
+		currentURL := b.collectRuntimePageURL(page)
+		if currentURL == "" {
+			currentURL = targetURL
+		}
+		if err := b.navigateExistingPageWithArtifacts(page, currentURL, waitTimeout(options.SettleTimeout), options.Headers, options.JSCodes, networkTracker); err != nil {
+			return nil, err
+		}
 	}
 	artifactPage := page.Timeout(waitTimeout(options.ArtifactTimeout))
 	defer artifactPage.CancelTimeout()
@@ -618,6 +658,7 @@ func VisitWithRealChromeRecovery(targetURL string, options RealChromeRecoveryOpt
 		NetworkRequests: networkRequests,
 		RuntimeMatches:  map[string]wappalyzer.AppInfo{},
 	}
+	result.BrowserResponse = captureBrowserResponseEvidence(artifactPage, body, title, networkRequests)
 	if options.CaptureFavicon {
 		result.Favicons = b.collectHeadlessFavicons(artifactPage, body, networkRequests)
 	}
@@ -744,106 +785,6 @@ func selectRealChromeRecoveryPage(browser *rod.Browser, targetURL string, timeou
 	return nil, errors.New("could not find a Chrome page target for browser recovery")
 }
 
-func seedRealChromeDocumentRequest(networkTracker *headlessNetworkTracker, page *rod.Page, responseHeaders map[string]string) {
-	info, err := page.Info()
-	if err != nil || info == nil {
-		return
-	}
-	pageURL := strings.TrimSpace(info.URL)
-	if pageURL == "" || !stringsutil.HasPrefixAnyI(pageURL, "http://", "https://") {
-		return
-	}
-	networkTracker.start(NetworkRequest{
-		RequestID:       "real-chrome-document",
-		URL:             pageURL,
-		Method:          http.MethodGet,
-		ResourceType:    "Document",
-		StatusCode:      http.StatusOK,
-		ResponseHeaders: responseHeaders,
-	})
-	networkTracker.finish("real-chrome-document")
-}
-
-func normalizeHTTPResponseHeaders(headers map[string][]string) map[string]string {
-	if len(headers) == 0 {
-		return nil
-	}
-
-	normalized := make(map[string]string, len(headers))
-	for name, values := range headers {
-		headerName := strings.ToLower(strings.TrimSpace(name))
-		if headerName == "" || len(values) == 0 {
-			continue
-		}
-		normalized[headerName] = strings.ToLower(strings.TrimSpace(strings.Join(values, ",")))
-	}
-	if len(normalized) == 0 {
-		return nil
-	}
-	return normalized
-}
-
-func seedPerformanceResourceRequests(networkTracker *headlessNetworkTracker, page *rod.Page) {
-	output, err := page.Eval(`() => JSON.stringify(performance.getEntriesByType("resource").map((entry) => ({
-		name: entry.name || "",
-		initiatorType: entry.initiatorType || ""
-	})).filter((entry) => /^https?:\/\//i.test(entry.name)).slice(0, 250))`)
-	if err != nil {
-		return
-	}
-
-	rawValue := fmt.Sprint(output.Value)
-	var serialized string
-	if err := json.Unmarshal([]byte(rawValue), &serialized); err != nil {
-		return
-	}
-
-	var entries []struct {
-		Name          string `json:"name"`
-		InitiatorType string `json:"initiatorType"`
-	}
-	if err := json.Unmarshal([]byte(serialized), &entries); err != nil {
-		return
-	}
-
-	for index, entry := range entries {
-		rawURL := strings.TrimSpace(entry.Name)
-		if rawURL == "" {
-			continue
-		}
-		requestID := fmt.Sprintf("performance-resource-%d", index)
-		networkTracker.start(NetworkRequest{
-			RequestID:    requestID,
-			URL:          rawURL,
-			Method:       http.MethodGet,
-			ResourceType: performanceInitiatorResourceType(entry.InitiatorType),
-			StatusCode:   http.StatusOK,
-			ErrorType:    "",
-		})
-		networkTracker.finish(requestID)
-	}
-}
-
-func performanceInitiatorResourceType(initiatorType string) string {
-	switch strings.ToLower(strings.TrimSpace(initiatorType)) {
-	case "script":
-		return "Script"
-	case "css", "link":
-		return "Stylesheet"
-	case "img", "image":
-		return "Image"
-	case "xmlhttprequest", "fetch":
-		return "XHR"
-	case "iframe", "frame":
-		return "Document"
-	default:
-		if strings.TrimSpace(initiatorType) != "" {
-			return strings.TrimSpace(initiatorType)
-		}
-		return "Other"
-	}
-}
-
 func sameOrSubdomain(hostname, parent string) bool {
 	hostname = strings.ToLower(strings.TrimSuffix(hostname, "."))
 	parent = strings.ToLower(strings.TrimSuffix(parent, "."))
@@ -856,8 +797,13 @@ func attachNetworkTracker(commandPage *rod.Page, eventPage *rod.Page, networkTra
 		if !stringsutil.HasPrefixAnyI(e.Request.URL, "http://", "https://") {
 			return
 		}
+		if e.RedirectResponse != nil {
+			networkTracker.response(string(e.RequestID), e.RedirectResponse.Status, string(e.Type), e.RedirectResponse.Headers)
+			networkTracker.finish(string(e.RequestID))
+		}
 		networkTracker.start(NetworkRequest{
 			RequestID:    string(e.RequestID),
+			FrameID:      string(e.FrameID),
 			URL:          e.Request.URL,
 			Method:       e.Request.Method,
 			ResourceType: string(e.Type),
@@ -2577,6 +2523,167 @@ func normalizeNetworkHeaders(headers proto.NetworkHeaders) map[string]string {
 	}
 
 	return normalized
+}
+
+func preserveNetworkHeaders(headers proto.NetworkHeaders) map[string]string {
+	if len(headers) == 0 {
+		return nil
+	}
+
+	preserved := make(map[string]string, len(headers))
+	for name, value := range headers {
+		headerName := strings.ToLower(strings.TrimSpace(name))
+		if headerName == "" {
+			continue
+		}
+		preserved[headerName] = strings.TrimSpace(value.String())
+	}
+
+	return preserved
+}
+
+func browserResponseURL(rawURL string) string {
+	parsed, err := url.Parse(strings.TrimSpace(rawURL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return ""
+	}
+	parsed.Fragment = ""
+	parsed.Scheme = strings.ToLower(parsed.Scheme)
+	parsed.Host = strings.ToLower(parsed.Host)
+	if (parsed.Scheme == "https" && parsed.Port() == "443") || (parsed.Scheme == "http" && parsed.Port() == "80") {
+		parsed.Host = parsed.Hostname()
+	}
+	if parsed.Path == "" {
+		parsed.Path = "/"
+	}
+	return parsed.String()
+}
+
+func selectBrowserDocumentResponse(finalURL string, requests []NetworkRequest) (NetworkRequest, int, bool) {
+	wantedURL := browserResponseURL(finalURL)
+	for index := len(requests) - 1; index >= 0; index-- {
+		request := requests[index]
+		if !strings.EqualFold(request.ResourceType, "Document") || request.StatusCode < 200 || request.StatusCode >= 400 {
+			continue
+		}
+		if wantedURL != "" && browserResponseURL(request.URL) != wantedURL {
+			continue
+		}
+		return request, index, true
+	}
+	return NetworkRequest{}, -1, false
+}
+
+func rawBrowserResponseHeaders(headers map[string]string) string {
+	if len(headers) == 0 {
+		return ""
+	}
+
+	names := make([]string, 0, len(headers))
+	for name := range headers {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	var builder strings.Builder
+	for _, name := range names {
+		builder.WriteString(name)
+		builder.WriteString(": ")
+		builder.WriteString(headers[name])
+		builder.WriteString("\r\n")
+	}
+	return builder.String()
+}
+
+func buildBrowserResponseEvidence(finalURL string, title string, body []byte, requests []NetworkRequest) *BrowserResponseEvidence {
+	document, documentIndex, ok := selectBrowserDocumentResponse(finalURL, requests)
+	if !ok {
+		return nil
+	}
+
+	headers := document.RawResponseHeaders
+	if len(headers) == 0 {
+		headers = document.ResponseHeaders
+	}
+	rawHeaders := rawBrowserResponseHeaders(headers)
+	contentType := strings.TrimSpace(strings.SplitN(headers["content-type"], ";", 2)[0])
+	lines := 0
+	if len(body) > 0 {
+		lines = bytes.Count(body, []byte("\n")) + 1
+	}
+
+	evidence := &BrowserResponseEvidence{
+		URL:             document.URL,
+		FinalURL:        finalURL,
+		StatusCode:      document.StatusCode,
+		Title:           strings.TrimSpace(title),
+		WebServer:       strings.TrimSpace(headers["server"]),
+		ContentType:     contentType,
+		ContentLength:   len(body),
+		Location:        strings.TrimSpace(headers["location"]),
+		ResponseHeaders: headers,
+		RawHeaders:      rawHeaders,
+		Hashes: map[string]string{
+			"body_md5":      hashes.Md5(body),
+			"body_mmh3":     hashes.Mmh3(body),
+			"body_sha256":   hashes.Sha256(body),
+			"header_md5":    hashes.Md5([]byte(rawHeaders)),
+			"header_mmh3":   hashes.Mmh3([]byte(rawHeaders)),
+			"header_sha256": hashes.Sha256([]byte(rawHeaders)),
+		},
+		Words:  len(strings.Fields(string(body))),
+		Lines:  lines,
+		Failed: false,
+	}
+
+	for index := 0; index <= documentIndex; index++ {
+		request := requests[index]
+		if !strings.EqualFold(request.ResourceType, "Document") {
+			continue
+		}
+		if document.FrameID != "" && request.FrameID != document.FrameID {
+			continue
+		}
+		if request.StatusCode < 300 || request.StatusCode >= 400 {
+			continue
+		}
+		evidence.ChainStatusCodes = append(evidence.ChainStatusCodes, request.StatusCode)
+		evidence.Chain = append(evidence.Chain, BrowserChainItem{
+			StatusCode: request.StatusCode,
+			Location:   request.RawResponseHeaders["location"],
+			RequestURL: request.URL,
+		})
+	}
+	evidence.ChainStatusCodes = append(evidence.ChainStatusCodes, document.StatusCode)
+	evidence.Chain = append(evidence.Chain, BrowserChainItem{
+		StatusCode: document.StatusCode,
+		Location:   document.RawResponseHeaders["location"],
+		RequestURL: document.URL,
+	})
+
+	return evidence
+}
+
+func captureBrowserResponseEvidence(page *rod.Page, renderedBody string, title string, requests []NetworkRequest) *BrowserResponseEvidence {
+	finalURL := (&Browser{}).collectRuntimePageURL(page)
+	document, _, ok := selectBrowserDocumentResponse(finalURL, requests)
+	if !ok {
+		return nil
+	}
+
+	body := []byte(renderedBody)
+	responseBody, err := (proto.NetworkGetResponseBody{RequestID: proto.NetworkRequestID(document.RequestID)}).Call(page)
+	if err == nil && responseBody != nil {
+		if responseBody.Base64Encoded {
+			if decoded, decodeErr := base64.StdEncoding.DecodeString(responseBody.Body); decodeErr == nil {
+				body = decoded
+			}
+		} else {
+			body = []byte(responseBody.Body)
+		}
+	}
+
+	return buildBrowserResponseEvidence(finalURL, title, body, requests)
 }
 
 func isLikelyJavaScriptURL(rawRequestURL string) bool {
