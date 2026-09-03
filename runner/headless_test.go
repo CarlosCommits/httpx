@@ -434,36 +434,86 @@ func TestParseBrowserWindowSizeRejectsInvalidValues(t *testing.T) {
 	}
 }
 
-func TestPerformanceInitiatorResourceType(t *testing.T) {
-	tests := map[string]string{
-		"script":         "Script",
-		"css":            "Stylesheet",
-		"link":           "Stylesheet",
-		"img":            "Image",
-		"xmlhttprequest": "XHR",
-		"fetch":          "XHR",
-		"iframe":         "Document",
-		"":               "Other",
+func TestBuildBrowserResponseEvidenceUsesRecoveredMainDocument(t *testing.T) {
+	requests := []NetworkRequest{
+		{
+			RequestID:          "challenge",
+			FrameID:            "main",
+			URL:                "https://example.com/",
+			ResourceType:       "Document",
+			StatusCode:         http.StatusForbidden,
+			RawResponseHeaders: map[string]string{"content-type": "text/html", "server": "challenge"},
+		},
+		{
+			RequestID:          "recovered",
+			FrameID:            "main",
+			URL:                "https://example.com/",
+			ResourceType:       "Document",
+			StatusCode:         http.StatusOK,
+			RawResponseHeaders: map[string]string{"content-type": "text/html; charset=utf-8", "server": "Origin Server"},
+		},
+		{
+			RequestID:          "iframe",
+			FrameID:            "child",
+			URL:                "https://third-party.example/frame",
+			ResourceType:       "Document",
+			StatusCode:         http.StatusOK,
+			RawResponseHeaders: map[string]string{"server": "iframe"},
+		},
 	}
 
-	for input, expected := range tests {
-		if got := performanceInitiatorResourceType(input); got != expected {
-			t.Fatalf("performanceInitiatorResourceType(%q) = %q, want %q", input, got, expected)
-		}
+	evidence := buildBrowserResponseEvidence(
+		"https://example.com/",
+		"Recovered title",
+		[]byte("<html>recovered body</html>"),
+		requests,
+	)
+	if evidence == nil {
+		t.Fatal("expected recovered browser response evidence")
+	}
+	if evidence.StatusCode != http.StatusOK || evidence.WebServer != "Origin Server" {
+		t.Fatalf("expected the recovered main document, got %#v", evidence)
+	}
+	if evidence.ContentType != "text/html" || evidence.ContentLength == 0 {
+		t.Fatalf("expected browser content metadata, got %#v", evidence)
+	}
+	if len(evidence.ChainStatusCodes) != 1 || evidence.ChainStatusCodes[0] != http.StatusOK {
+		t.Fatalf("expected the challenge response to stay out of the redirect chain, got %#v", evidence.ChainStatusCodes)
+	}
+	if evidence.Hashes["body_sha256"] == "" || evidence.Hashes["header_sha256"] == "" {
+		t.Fatalf("expected body and header hashes, got %#v", evidence.Hashes)
 	}
 }
 
-func TestNormalizeHTTPResponseHeaders(t *testing.T) {
-	headers := normalizeHTTPResponseHeaders(map[string][]string{
-		"X-Powered-By":  {"Express"},
-		"Cache-Control": {"no-cache", "no-store"},
-	})
-
-	if headers["x-powered-by"] != "express" {
-		t.Fatalf("expected x-powered-by to be normalized, got %#v", headers)
+func TestBuildBrowserResponseEvidencePreservesRedirectChain(t *testing.T) {
+	requests := []NetworkRequest{
+		{
+			RequestID:          "document",
+			FrameID:            "main",
+			URL:                "http://example.com/",
+			ResourceType:       "Document",
+			StatusCode:         http.StatusMovedPermanently,
+			RawResponseHeaders: map[string]string{"location": "https://example.com/"},
+		},
+		{
+			RequestID:          "document",
+			FrameID:            "main",
+			URL:                "https://example.com/",
+			ResourceType:       "Document",
+			StatusCode:         http.StatusOK,
+			RawResponseHeaders: map[string]string{"content-type": "text/html"},
+		},
 	}
-	if headers["cache-control"] != "no-cache,no-store" {
-		t.Fatalf("expected multi-value header to be joined, got %#v", headers)
+
+	evidence := buildBrowserResponseEvidence("https://example.com/", "Example", []byte("ok"), requests)
+	if evidence == nil {
+		t.Fatal("expected browser response evidence")
+	}
+	if got := fmt.Sprint(evidence.ChainStatusCodes); got != "[301 200]" {
+		t.Fatalf("expected ordered redirect chain, got %s", got)
+	}
+	if evidence.Chain[0].Location != "https://example.com/" {
+		t.Fatalf("expected redirect location to be retained, got %#v", evidence.Chain[0])
 	}
 }
 
