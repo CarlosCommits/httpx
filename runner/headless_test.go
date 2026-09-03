@@ -480,7 +480,8 @@ func TestBuildBrowserResponseEvidenceUsesRecoveredMainDocument(t *testing.T) {
 	if len(evidence.ChainStatusCodes) != 1 || evidence.ChainStatusCodes[0] != http.StatusOK {
 		t.Fatalf("expected the challenge response to stay out of the redirect chain, got %#v", evidence.ChainStatusCodes)
 	}
-	if evidence.Hashes["body_sha256"] == "" || evidence.Hashes["header_sha256"] == "" {
+	if evidence.Hashes["body_sha256"] == "" || evidence.Hashes["header_sha256"] == "" ||
+		evidence.Hashes["body_simhash"] == "" || evidence.Hashes["header_simhash"] == "" {
 		t.Fatalf("expected body and header hashes, got %#v", evidence.Hashes)
 	}
 }
