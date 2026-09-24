@@ -142,8 +142,8 @@ func New(options *Options) (*HTTPX, error) {
 		}
 	}
 	transport := &http.Transport{
-		DialContext: httpx.Dialer.Dial,
-		DialTLSContext: httpx.buildTLSDialer(options),
+		DialContext:         httpx.Dialer.Dial,
+		DialTLSContext:      httpx.buildTLSDialer(options),
 		MaxIdleConnsPerHost: -1,
 		TLSClientConfig: &tls.Config{
 			InsecureSkipVerify: true,
@@ -280,9 +280,10 @@ get_response:
 
 	// the body is capped before dumping the response to avoid loading unbounded
 	// bodies (or infinite streams) in memory
-	bodyTruncated := h.Options.MaxResponseBodySizeToRead > 0 && httpresp.ContentLength > h.Options.MaxResponseBodySizeToRead
+	var bodyReader *io.LimitedReader
 	if h.Options.MaxResponseBodySizeToRead > 0 {
-		httpresp.Body = io.NopCloser(io.LimitReader(httpresp.Body, h.Options.MaxResponseBodySizeToRead))
+		bodyReader = &io.LimitedReader{R: httpresp.Body, N: h.Options.MaxResponseBodySizeToRead}
+		httpresp.Body = io.NopCloser(bodyReader)
 		if !shouldSkipBodyRead {
 			defer func() {
 				_, _ = io.Copy(io.Discard, httpresp.Body)
@@ -302,6 +303,8 @@ get_response:
 		// Serializing a response whose body was capped fails with "ContentLength=x with
 		// Body length y", although headers and the truncated body are dumped correctly.
 		// An intentional truncation must not turn a valid response into a failed one.
+		// A disconnect before reaching the read limit must still fail.
+		bodyTruncated := bodyReader != nil && bodyReader.N == 0 && httpresp.ContentLength > h.Options.MaxResponseBodySizeToRead
 		if bodyTruncated && stringsutil.ContainsAny(err.Error(), "with Body length") {
 			shouldIgnoreErrors = true
 		}

@@ -220,3 +220,31 @@ func TestDoTruncatedBodyIsNotAFailure(t *testing.T) {
 	require.Len(t, resp.Data, readSize, "body must be capped to the configured read size")
 	require.Contains(t, resp.RawHeaders, "Content-Length: "+strconv.Itoa(len(body)))
 }
+
+func TestDoBodyDisconnectedBeforeReadLimitIsFailure(t *testing.T) {
+	const advertisedSize = 4096
+	const readSize = 10
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Header().Set("Content-Length", strconv.Itoa(advertisedSize))
+		w.Header().Set("Connection", "close")
+		_, _ = w.Write([]byte("AAA"))
+	}))
+	defer ts.Close()
+
+	options := DefaultOptions
+	options.CdnCheck = "false"
+	options.Timeout = 5 * time.Second
+	options.RetryMax = 0
+	options.MaxResponseBodySizeToRead = readSize
+
+	ht, err := New(&options)
+	require.NoError(t, err)
+	req, err := retryablehttp.NewRequest(http.MethodGet, ts.URL, nil)
+	require.NoError(t, err)
+
+	resp, err := ht.Do(req, UnsafeOptions{})
+
+	require.Error(t, err, "a disconnect before the read limit must not be treated as intentional truncation")
+	require.Nil(t, resp)
+}
